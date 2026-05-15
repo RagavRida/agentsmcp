@@ -5,7 +5,7 @@
  * Usage:
  *   npx ts-node src/kickoff.ts "summarize diffusion models"
  */
-import { AgentMailbox } from "agentmailbox";
+import { AgentMailbox } from "agentsmcp";
 
 const SERVER = process.env.AGENTMAILBOX_SERVER ?? "http://localhost:3000";
 const ME = "user@demo";

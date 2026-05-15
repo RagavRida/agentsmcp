@@ -8,7 +8,7 @@
  * already participates in, so it picks up cold from researcher's last
  * snapshot — no local state required.
  */
-import { AgentMailbox } from "agentmailbox";
+import { AgentMailbox } from "agentsmcp";
 import { complete } from "./llm";
 
 const SERVER = process.env.AGENTMAILBOX_SERVER ?? "http://localhost:3000";

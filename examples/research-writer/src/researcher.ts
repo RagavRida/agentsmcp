@@ -3,7 +3,7 @@
  * calls Claude to "find papers", then sends results to the writer
  * with a contextSnapshot describing what it just did.
  */
-import { AgentMailbox } from "agentmailbox";
+import { AgentMailbox } from "agentsmcp";
 import { complete } from "./llm";
 
 const SERVER = process.env.AGENTMAILBOX_SERVER ?? "http://localhost:3000";

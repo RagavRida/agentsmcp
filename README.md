@@ -3,7 +3,7 @@
 Context-sync protocol for AI agents.
 Every agent has a mailbox. No agent ever starts cold.
 
-[![npm](https://img.shields.io/npm/v/agentmailbox.svg?label=npm%20agentmailbox)](https://www.npmjs.com/package/agentmailbox)
+[![npm](https://img.shields.io/npm/v/agentsmcp.svg?label=npm%20agentsmcp)](https://www.npmjs.com/package/agentsmcp)
 [![PyPI](https://img.shields.io/pypi/v/agentmailbox.svg?label=PyPI%20agentmailbox)](https://pypi.org/project/agentmailbox/)
 [![npm mcp](https://img.shields.io/npm/v/agentmailbox-mcp.svg?label=npm%20agentmailbox-mcp)](https://www.npmjs.com/package/agentmailbox-mcp)
 [![CI](https://github.com/RagavRida/agentmailbox/actions/workflows/ci.yml/badge.svg)](https://github.com/RagavRida/agentmailbox/actions/workflows/ci.yml)
@@ -12,7 +12,7 @@ Every agent has a mailbox. No agent ever starts cold.
 
 ```bash
 # JavaScript / TypeScript SDK + server
-npm install agentmailbox
+npm install agentsmcp
 
 # Python SDK
 pip install agentmailbox
@@ -35,7 +35,7 @@ Override with `PORT` and `AGENTMAILBOX_DB` env vars.
 ## Quick Start
 
 ```ts
-import { AgentMailbox } from "agentmailbox";
+import { AgentMailbox } from "agentsmcp";
 
 const researcher = new AgentMailbox({
   agentId: "researcher@demo",
