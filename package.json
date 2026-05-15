@@ -13,13 +13,13 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "npm run clean && tsc",
     "start": "ts-node src/server.ts",
     "example": "ts-node examples/basic.ts",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run clean && npm run build && npm test"
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "agents",
