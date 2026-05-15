@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-05-16
+
+### Fixed
+
+- `main` / `types` pointed at the client SDK file, so installs from npm
+  only exposed `AgentMailbox` and `assembleContext` — `createServer`,
+  `createStorage`, `SqliteStorage`, and the deprecated alias were
+  unreachable. Now points at `dist/index.js` / `dist/index.d.ts`, the
+  full barrel.
+
 ## 0.2.0 — 2026-05-16
 
 ### Changed (breaking)
