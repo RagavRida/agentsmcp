@@ -6,7 +6,7 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { AgentMailbox } from "../../dist/agentmailbox";
+import type { AgentMailbox } from "agentsmcp";
 
 import { listToolDefs, runTool } from "./tools";
 import {
@@ -17,7 +17,7 @@ import {
 
 export function buildServer(agent: AgentMailbox): Server {
   const server = new Server(
-    { name: "agentmailbox", version: "0.1.0" },
+    { name: "agentsmcp", version: "0.1.0" },
     { capabilities: { tools: {}, resources: {} } }
   );
 

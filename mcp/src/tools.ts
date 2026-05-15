@@ -10,7 +10,7 @@ const _zodToJsonSchema = require("zod-to-json-schema").zodToJsonSchema as (
 
 const toJsonSchema = (s: ZodTypeAny): Record<string, unknown> =>
   _zodToJsonSchema(s, { target: "openApi3" }) as Record<string, unknown>;
-import type { AgentMailbox } from "../../dist/agentmailbox";
+import type { AgentMailbox } from "agentsmcp";
 
 const JsonValue: z.ZodType<unknown> = z.lazy(() =>
   z.union([
@@ -64,7 +64,7 @@ interface ToolDef {
 
 const TOOL_DEFS: ToolDef[] = [
   {
-    name: "agentmailbox_send",
+    name: "agentsmcp_send",
     description:
       "Send a message to another agent. Auto-creates a thread if none exists " +
       "between sender and recipient. Use cc for active participants, bcc for " +
@@ -83,7 +83,7 @@ const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
-    name: "agentmailbox_receive",
+    name: "agentsmcp_receive",
     description:
       "Get unread messages addressed to this agent, with full thread context " +
       "attached to each. Use this at the start of a turn to pick up cold.",
@@ -94,7 +94,7 @@ const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
-    name: "agentmailbox_unread",
+    name: "agentsmcp_unread",
     description: "List unread context frames without consuming them.",
     schema: EmptyInput,
     handler: async (agent, raw) => {
@@ -103,7 +103,7 @@ const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
-    name: "agentmailbox_sync",
+    name: "agentsmcp_sync",
     description:
       "Rejoin a thread with full assembled context (snapshot + recent 10 " +
       "messages verbatim + summary of older ones). Use after a restart or " +
@@ -116,7 +116,7 @@ const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
-    name: "agentmailbox_threads",
+    name: "agentsmcp_threads",
     description: "List all threads this agent is part of.",
     schema: EmptyInput,
     handler: async (agent, raw) => {
@@ -125,7 +125,7 @@ const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
-    name: "agentmailbox_mark_read",
+    name: "agentsmcp_mark_read",
     description: "Mark a thread as read for this agent.",
     schema: MarkReadInput,
     handler: async (agent, raw) => {
@@ -135,7 +135,7 @@ const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
-    name: "agentmailbox_reply_all",
+    name: "agentsmcp_reply_all",
     description:
       "Reply to every visible participant on a thread (excluding the sender " +
       "and BCC'd agents).",
@@ -148,7 +148,7 @@ const TOOL_DEFS: ToolDef[] = [
     },
   },
   {
-    name: "agentmailbox_participants",
+    name: "agentsmcp_participants",
     description:
       "List visible participants on a thread with their roles (to/cc/bcc). " +
       "BCC participants are only shown if this agent bcc'd them.",

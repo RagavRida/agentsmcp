@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-import { AgentMailbox } from "../../dist/agentmailbox";
+import { AgentMailbox } from "agentsmcp";
 
 import { buildServer } from "./server";
 
@@ -36,13 +36,13 @@ function parseArgs(argv: string[]): Partial<Config> {
 
 function printUsage(): void {
   process.stderr.write(
-    "usage: agentmailbox-mcp [--agent-id ID] [--server URL] [--api-key KEY]\n" +
+    "usage: agentsmcp-adapter [--agent-id ID] [--server URL] [--api-key KEY]\n" +
       "env: AGENTMAILBOX_AGENT_ID, AGENTMAILBOX_SERVER, AGENTMAILBOX_API_KEY\n"
   );
 }
 
 function die(msg: string): never {
-  process.stderr.write(`agentmailbox-mcp: ${msg}\n`);
+  process.stderr.write(`agentsmcp-adapter: ${msg}\n`);
   process.exit(1);
 }
 
@@ -80,7 +80,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
 
   const shutdown = async (signal: string): Promise<void> => {
-    process.stderr.write(`agentmailbox-mcp: ${signal} received, shutting down\n`);
+    process.stderr.write(`agentsmcp-adapter: ${signal} received, shutting down\n`);
     try {
       await server.close();
     } catch {
@@ -93,12 +93,12 @@ async function main(): Promise<void> {
 
   await server.connect(transport);
   process.stderr.write(
-    `agentmailbox-mcp: connected as ${cfg.agentId} -> ${cfg.server}\n`
+    `agentsmcp-adapter: connected as ${cfg.agentId} -> ${cfg.server}\n`
   );
 }
 
 main().catch((err: unknown) => {
   const msg = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`agentmailbox-mcp: fatal: ${msg}\n`);
+  process.stderr.write(`agentsmcp-adapter: fatal: ${msg}\n`);
   process.exit(1);
 });

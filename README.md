@@ -5,7 +5,7 @@ Every agent has a mailbox. No agent ever starts cold.
 
 [![npm](https://img.shields.io/npm/v/agentsmcp.svg?label=npm%20agentsmcp)](https://www.npmjs.com/package/agentsmcp)
 [![PyPI](https://img.shields.io/pypi/v/agentmailbox.svg?label=PyPI%20agentmailbox)](https://pypi.org/project/agentmailbox/)
-[![npm mcp](https://img.shields.io/npm/v/agentmailbox-mcp.svg?label=npm%20agentmailbox-mcp)](https://www.npmjs.com/package/agentmailbox-mcp)
+[![npm adapter](https://img.shields.io/npm/v/agentsmcp-adapter.svg?label=npm%20agentsmcp-adapter)](https://www.npmjs.com/package/agentsmcp-adapter)
 [![CI](https://github.com/RagavRida/agentmailbox/actions/workflows/ci.yml/badge.svg)](https://github.com/RagavRida/agentmailbox/actions/workflows/ci.yml)
 
 ## Install
@@ -18,7 +18,7 @@ npm install agentsmcp
 pip install agentmailbox
 
 # MCP adapter (Claude Desktop, Cursor, Continue, ...)
-npm install -g agentmailbox-mcp
+npm install -g agentsmcp-adapter
 ```
 
 ## Start the server
@@ -132,16 +132,16 @@ process restart, see [`examples/research-writer/`](./examples/research-writer/RE
 
 ## MCP adapter
 
-`agentmailbox-mcp` exposes the protocol to any MCP-aware client (Claude
+`agentsmcp-adapter` exposes the protocol to any MCP-aware client (Claude
 Desktop, Cursor, Continue, ...) as a set of tools — no SDK or glue
 code in the client.
 
 ```json
 {
   "mcpServers": {
-    "agentmailbox": {
+    "agentsmcp": {
       "command": "npx",
-      "args": ["-y", "agentmailbox-mcp"],
+      "args": ["-y", "agentsmcp-adapter"],
       "env": {
         "AGENTMAILBOX_AGENT_ID": "claude@local",
         "AGENTMAILBOX_SERVER": "http://localhost:3000"

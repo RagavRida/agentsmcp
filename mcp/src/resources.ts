@@ -1,7 +1,7 @@
-import type { AgentMailbox } from "../../dist/agentmailbox";
+import type { AgentMailbox } from "agentsmcp";
 
-export const MAILBOX_URI = "agentmailbox://mailbox";
-export const THREAD_URI_PREFIX = "agentmailbox://thread/";
+export const MAILBOX_URI = "agentsmcp://mailbox";
+export const THREAD_URI_PREFIX = "agentsmcp://thread/";
 
 export interface ResourceListing {
   uri: string;
