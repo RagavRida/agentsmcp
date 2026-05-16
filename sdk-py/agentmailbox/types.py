@@ -23,11 +23,29 @@ class Message:
 
 
 @dataclass
+class ThreadSummary:
+    """Structured summary produced by a Compressor on the server side.
+
+    Available since server 0.3.0 / Python SDK 0.1.1. ``None`` on threads
+    that haven't crossed the compression threshold yet, or on servers
+    running an older build.
+    """
+
+    text: str
+    decisions: List[str]
+    open_questions: List[str]
+    artifacts: Dict[str, Any]
+    covers_message_ids: List[str]
+    generated_at: int
+
+
+@dataclass
 class Context:
     snapshot: Dict[str, Any]
     thread_summary: str
     recent_messages: List[Message]
     token_count: int = 0
+    thread_summary_structured: Optional["ThreadSummary"] = None
 
 
 @dataclass

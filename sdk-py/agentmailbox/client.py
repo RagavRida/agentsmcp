@@ -176,6 +176,7 @@ class AgentMailbox:
                 thread_summary=last.context.thread_summary,
                 recent_messages=last.context.recent_messages,
                 token_count=last.context.token_count,
+                thread_summary_structured=last.context.thread_summary_structured,
             )
         else:
             ctx = Context(

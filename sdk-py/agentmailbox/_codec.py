@@ -16,7 +16,22 @@ from .types import (
     Role,
     SendResult,
     Thread,
+    ThreadSummary,
 )
+
+
+def _thread_summary_from_json(d: Optional[Dict[str, Any]]) -> Optional[ThreadSummary]:
+    if not d:
+        return None
+    artifacts = d.get("artifacts")
+    return ThreadSummary(
+        text=str(d.get("text") or ""),
+        decisions=list(d.get("decisions") or []),
+        open_questions=list(d.get("openQuestions") or []),
+        artifacts=dict(artifacts) if isinstance(artifacts, dict) else {},
+        covers_message_ids=list(d.get("coversMessageIds") or []),
+        generated_at=int(d.get("generatedAt", 0)),
+    )
 
 
 def message_from_json(d: Dict[str, Any]) -> Message:
@@ -40,6 +55,9 @@ def context_from_json(d: Dict[str, Any]) -> Context:
         thread_summary=d.get("threadSummary") or "",
         recent_messages=[message_from_json(m) for m in d.get("recentMessages") or []],
         token_count=int(d.get("tokenCount", 0)),
+        thread_summary_structured=_thread_summary_from_json(
+            d.get("threadSummaryStructured")
+        ),
     )
 
 
