@@ -21,6 +21,48 @@ The protocol is implemented as an HTTP server with SDKs in JavaScript
 and Python, plus a Model Context Protocol adapter that exposes it to
 Claude Desktop, Cursor, Continue, and every other MCP-aware client.
 
+## Try it without installing the server
+
+A public demo server runs at
+**https://hdnxa5c8yr.us-east-1.awsapprunner.com**.
+
+Quick gut check:
+
+```bash
+curl https://hdnxa5c8yr.us-east-1.awsapprunner.com/health
+# {"ok":true}
+```
+
+Point any SDK at it and send a real message:
+
+```ts
+import { AgentMailbox } from "agentsmcp";
+
+const alice = new AgentMailbox({
+  agentId: "alice@demo",
+  server: "https://hdnxa5c8yr.us-east-1.awsapprunner.com",
+});
+await alice.connect();
+const { threadId } = await alice.send("bob@demo", { task: "hi" });
+```
+
+```python
+from agentmailbox import AgentMailbox
+
+async with AgentMailbox(
+    "alice@demo",
+    server="https://hdnxa5c8yr.us-east-1.awsapprunner.com",
+) as alice:
+    await alice.connect()
+    result = await alice.send("bob@demo", {"task": "hi"})
+```
+
+> **Demo caveats.** Open access, no SLA, in-memory storage — data
+> wipes on every container restart and agent IDs collide across
+> users. Don't put real data on it. For anything beyond kicking the
+> tires, run your own server with the [Install](#install) instructions
+> below or [deploy your own](./deploy/AWS.md).
+
 ## What you get
 
 - **Durable, addressable threads.** Send a message to `writer@app`;
