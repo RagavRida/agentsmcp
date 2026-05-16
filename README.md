@@ -1,27 +1,60 @@
 # AgentMailbox
 
-Context-sync protocol for AI agents.
-Every agent has a mailbox. No agent ever starts cold.
+**A context-sync protocol for AI agents.** Every agent has a mailbox. No
+agent ever starts cold.
 
 [![npm](https://img.shields.io/npm/v/agentsmcp.svg?label=npm%20agentsmcp)](https://www.npmjs.com/package/agentsmcp)
 [![PyPI](https://img.shields.io/pypi/v/agentsmcp.svg?label=PyPI%20agentsmcp)](https://pypi.org/project/agentsmcp/)
 [![npm adapter](https://img.shields.io/npm/v/agentsmcp-adapter.svg?label=npm%20agentsmcp-adapter)](https://www.npmjs.com/package/agentsmcp-adapter)
 [![CI](https://github.com/RagavRida/agentsmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/RagavRida/agentsmcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
+---
+
+Agents today lose context between runs, restarts, and handoffs. Every
+agent framework reinvents persistence, and none of them interoperate.
+AgentMailbox solves this with a single primitive: **every message
+carries the thread's full state**. Any agent, any framework, any
+restart picks up exactly where the last one left off.
+
+The protocol is implemented as an HTTP server with SDKs in JavaScript
+and Python, plus a Model Context Protocol adapter that exposes it to
+Claude Desktop, Cursor, Continue, and every other MCP-aware client.
+
+## What you get
+
+- **Durable, addressable threads.** Send a message to `writer@app`;
+  the server creates the thread, persists it, and fans it out to
+  every recipient (`to`, `cc`, `bcc`).
+- **Cold-restart by construction.** An agent process can crash mid-task
+  and resume on restart by reading the thread — no local state, no
+  checkpointing logic to write.
+- **Structured context compression.** Threads stay joinable forever:
+  older messages fold into a structured summary
+  (`decisions`, `openQuestions`, `artifacts`) the moment they cross
+  a configurable threshold. Default is zero-config; opt in to
+  Claude-backed compression with one constructor argument.
+- **Cross-tool peer participation.** Any MCP-aware client becomes a
+  peer in the conversation without writing SDK code.
+- **Multi-agent semantics.** TO / CC / BCC roles work the way email
+  does, with full context propagated to every recipient.
 
 ## Install
 
 ```bash
-# JavaScript / TypeScript SDK + server
+# JavaScript / TypeScript SDK + HTTP server
 npm install agentsmcp
 
-# Python SDK (distribution name; import as `agentmailbox`)
+# Python SDK (PyPI distribution name; import path stays `agentmailbox`)
 pip install agentsmcp
 
-# MCP adapter (Claude Desktop, Cursor, Continue, ...)
+# MCP adapter for Claude Desktop / Cursor / Continue / ...
 npm install -g agentsmcp-adapter
 ```
 
-## Start the server
+## Quick start
+
+### 1. Start the server
 
 ```bash
 npx agentmailbox-server
@@ -32,7 +65,7 @@ npm run start
 Defaults: `http://localhost:3000`, SQLite at `./agentmailbox.db`.
 Override with `PORT` and `AGENTMAILBOX_DB` env vars.
 
-## Quick Start
+### 2. Send a message
 
 ```ts
 import { AgentMailbox } from "agentsmcp";
@@ -48,8 +81,11 @@ const { threadId } = await researcher.send(
   { task: "summarize diffusion models", papers: ["paper1", "paper2"] },
   { contextSnapshot: { step: "research_complete", paperCount: 2 } }
 );
+```
 
-// Writer — picks up full context even after restart.
+### 3. Receive — even after a restart
+
+```ts
 const writer = new AgentMailbox({
   agentId: "writer@demo",
   server: "http://localhost:3000",
@@ -57,54 +93,58 @@ const writer = new AgentMailbox({
 await writer.connect();
 
 const { messages, context } = await writer.receive();
-console.log(context.snapshot);
-// → { step: "research_complete", paperCount: 2 }
-
-await writer.send(
-  "researcher@demo",
-  { draft: "Diffusion models work by..." },
-  { threadId, contextSnapshot: { step: "draft_complete", wordCount: 500 } }
-);
+// context.snapshot                  → researcher's state at send time
+// context.threadSummaryStructured   → structured summary of older messages
+// context.recentMessages            → last 10 verbatim
 ```
 
-Run the bundled demo:
-
-```bash
-npm run start &       # server
-npm run example       # two-agent flow
-```
-
-## Authentication
-
-Set `AGENTMAILBOX_API_KEY` on the server and pass `apiKey` to the SDK to
-require auth. With the env var unset the server is open (current
-behaviour). With it set, every route except `/health` requires
-`Authorization: Bearer <key>` — missing or wrong returns 401.
-
-```bash
-AGENTMAILBOX_API_KEY=s3cret npx agentmailbox-server
-```
-
-```ts
-new AgentMailbox({ agentId: "x@demo", server: "...", apiKey: "s3cret" });
-```
+The Python SDK mirrors the same surface:
 
 ```python
-AgentMailbox("x@demo", server="...", api_key="s3cret")
+from agentmailbox import AgentMailbox
+
+async with AgentMailbox("writer@demo", server="http://localhost:3000") as writer:
+    await writer.connect()
+    result = await writer.receive()
+    snapshot = result.context.snapshot
+    summary = result.context.thread_summary_structured  # None until threshold crossed
 ```
 
-## Multi-Agent Threads
+## The headline demo
+
+[`examples/research-bench/`](./examples/research-bench/README.md) —
+a multi-agent research thread you can join from Claude Desktop. One
+command boots a supervisor with two long-running agents; you drop in
+via the MCP adapter and steer them. Kill any process and the system
+keeps working.
+
+It demonstrates, in one runnable artifact, the four things AgentMailbox
+gives you that no other agent library does in a single page:
+
+1. Cross-tool visibility — Claude Desktop reads agent threads via MCP.
+2. Cross-tool steering — you are a peer participant, not just an
+   observer.
+3. Crash-survival — `coldResume()` on agent startup is the entire
+   persistence story.
+4. Compression in action — after ~30 messages, threads return a
+   structured summary instead of raw history.
+
+A minimal two-agent SDK-only pipeline is also available at
+[`examples/research-writer/`](./examples/research-writer/README.md).
+
+## Multi-agent threads
 
 CC, BCC, and ReplyAll work the way email does — but with full context
 propagated to every recipient on every message.
 
-Three roles:
+| Role | Visibility | Can reply |
+|---|---|---|
+| `to` | Primary recipient, context owner | Yes |
+| `cc` | Active participant | Yes |
+| `bcc` | Silent participant; invisible to others | Yes |
 
-- **TO** — primary recipient, context owner.
-- **CC** — active participant, receives full context, can reply.
-- **BCC** — silent participant, receives context, invisible to others.
-  The `bcc` field is stripped from the message in every view except
-  the original sender's.
+The `bcc` field is stripped from every message view except the original
+sender's.
 
 ```ts
 const { threadId } = await orchestrator.send(
@@ -120,25 +160,36 @@ const { threadId } = await orchestrator.send(
 await researcher.replyAll(threadId, { result: "found 50 papers" });
 ```
 
-Run the multi-agent demo:
+## Context compression
 
-```bash
-npm run start &
-npx ts-node examples/multi-agent.ts
+Threads grow without bound; the verbatim window does not. The server
+folds older messages into a structured `ThreadSummary` and caches it.
+
+```ts
+import { createServer, ClaudeCompressor } from "agentsmcp";
+
+const { app, ready } = createServer("./db.sqlite", {
+  compressor: new ClaudeCompressor(),     // reads ANTHROPIC_API_KEY
+  compressionThreshold: 20,               // default
+});
+await ready;
+app.listen(3000);
 ```
 
-**The killer demo** — multi-agent research thread you can join from
-Claude Desktop, with cross-tool steering, cold-restart, and compression
-in action: [`examples/research-bench/`](./examples/research-bench/README.md).
+`ClaudeCompressor` calls Claude Haiku and extracts `{ text, decisions,
+openQuestions, artifacts, coversMessageIds, generatedAt }`. The default
+is `NoopCompressor` — keeps zero-config installs working without an
+LLM dependency. The interface is provider-agnostic; additional
+compressors (OpenAI, local models) can be added by implementing
+`Compressor.compress()`.
 
-A minimal two-agent pipeline (no MCP, just SDK) is also available at
-[`examples/research-writer/`](./examples/research-writer/README.md).
+`@anthropic-ai/sdk` is an optional peer dependency, installed only by
+projects that use `ClaudeCompressor`.
 
 ## MCP adapter
 
-`agentsmcp-adapter` exposes the protocol to any MCP-aware client (Claude
-Desktop, Cursor, Continue, ...) as a set of tools — no SDK or glue
-code in the client.
+`agentsmcp-adapter` exposes the protocol to any MCP-aware client. Each
+adapter instance represents one agent identity.
 
 ```json
 {
@@ -155,55 +206,111 @@ code in the client.
 }
 ```
 
-See [`mcp/README.md`](./mcp/README.md) for the full tool list.
+Eight tools and two read-only resources are exposed. See
+[`mcp/README.md`](./mcp/README.md) for the full reference.
 
 ## HTTP API
 
-| Method | Path                                   | Purpose                                       |
-| ------ | -------------------------------------- | --------------------------------------------- |
-| POST   | `/agents/register`                     | Register an agent, create its mailbox         |
-| POST   | `/messages/send`                       | Send a message; supports cc/bcc/replyTo       |
-| POST   | `/messages/reply-all`                  | Reply to every visible participant on a thread |
-| GET    | `/mailbox/:agentId`                    | All threads for an agent (bcc stripped)       |
-| GET    | `/mailbox/:agentId/unread`             | Unread messages as full context frames        |
-| POST   | `/mailbox/:agentId/read`               | Mark a thread read                            |
-| GET    | `/threads/:threadId`                   | Full thread, all messages + context           |
-| GET    | `/threads/:threadId/sync`              | Assembled context (snapshot + recent 10)      |
-| GET    | `/threads/:threadId/participants`      | Visible participants with roles               |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/agents/register` | Register an agent, create its mailbox |
+| POST | `/messages/send` | Send a message; supports `cc`, `bcc`, `replyTo` |
+| POST | `/messages/reply-all` | Reply to every visible participant |
+| GET | `/mailbox/:agentId` | All threads for an agent (bcc stripped) |
+| GET | `/mailbox/:agentId/unread` | Unread messages as full context frames |
+| POST | `/mailbox/:agentId/read` | Mark a thread read |
+| GET | `/threads/:threadId` | Full thread with messages |
+| GET | `/threads/:threadId/sync` | Assembled context (snapshot + summary + recent 10) |
+| GET | `/threads/:threadId/participants` | Visible participants with roles |
 
-## Why AgentMailbox
+## Authentication
 
-Agents today lose context between runs, restarts, and handoffs.
-AgentMailbox makes context persistence the protocol — not an afterthought.
+Set `AGENTMAILBOX_API_KEY` on the server and pass `apiKey` to every
+SDK constructor. With the env var unset the server is open; with it
+set, every route except `/health` requires
+`Authorization: Bearer <key>` and returns 401 otherwise.
 
-Every message carries:
-- the recipient agent's full inbox thread
-- the sender's `contextSnapshot` at send time
-- a rolling summary of older messages
-- the last 10 messages verbatim
-- a rough token count
+```bash
+AGENTMAILBOX_API_KEY=s3cret npx agentmailbox-server
+```
 
-Pick up a thread cold, you still know exactly where things stand.
+```ts
+new AgentMailbox({ agentId: "x@demo", server: "...", apiKey: "s3cret" });
+```
+
+```python
+AgentMailbox("x@demo", server="...", api_key="s3cret")
+```
+
+## How it works
+
+Every message persisted by the server carries enough state for any
+recipient — present or future — to reconstruct the thread without
+local memory. On `receive()` or `sync()`, the server returns:
+
+- `snapshot` — the sender's `contextSnapshot` from the last message
+- `threadSummaryStructured` — a cached structured summary of older
+  messages (populated once the compression threshold is crossed)
+- `threadSummary` — the prose `text` field of the structured summary,
+  for callers that just want a string
+- `recentMessages` — last 10 messages verbatim
+- `tokenCount` — rough estimate of the combined payload size
+
+Storage is pluggable: ship-default SQLite, with the
+`Storage` interface ready for Postgres and Redis adapters. Compression
+is pluggable through the `Compressor` interface.
 
 ## Development
 
 ```bash
+# JS SDK + server
 npm ci && npx tsc --noEmit && npm test
+
+# MCP adapter
 cd mcp && npm ci && npx tsc --noEmit && npm run build
+
+# Python SDK
 cd sdk-py && pip install -e ".[dev]" && pytest -q
 ```
 
-## Roadmap
+The full test matrix runs in CI on every push to `main`.
 
-- [x] Core protocol
-- [x] JS SDK
-- [x] CC/BCC/ReplyAll multi-agent threads
-- [x] Python SDK
-- [x] MCP server adapter
-- [x] Optional API-key auth
-- [ ] LLM-based context compression
-- [ ] Cloud hosted tier
-- [ ] Thread dashboard UI
+## Contributing
+
+Contributions are welcome. The protocol is small and the surface is
+deliberately stable, but there is a lot of useful work still to do.
+
+**Particularly wanted:**
+
+- Additional `Compressor` adapters (OpenAI, Gemini, Bedrock, Ollama
+  for local models). The interface is small — ~80 lines per adapter.
+- Additional `Storage` adapters (Postgres, Redis). The `Storage`
+  interface is async-first and provider-agnostic; SQLite is the
+  reference implementation.
+- Framework adapters (LangGraph checkpointer, CrewAI task handoff,
+  Vercel AI SDK middleware).
+- Real-world demos beyond `examples/research-bench`. Multi-day
+  workflows, cross-language pipelines, agent-in-the-loop patterns.
+- Documentation, tutorials, and integration recipes.
+
+**Process:**
+
+1. Open an issue describing what you want to build or change. Small
+   PRs that fix bugs or add tests can skip this step.
+2. Fork, branch, and submit a PR against `main`. Match the existing
+   coding style (no formatter beyond TypeScript defaults; tests
+   colocated with code under `tests/`).
+3. CI must be green. Run the test matrix locally before pushing:
+   ```bash
+   npm ci && npx tsc --noEmit && npm test
+   cd mcp && npm ci && npx tsc --noEmit && npm run build
+   cd sdk-py && pip install -e ".[dev]" && pytest -q
+   ```
+4. Include a CHANGELOG entry under the current unreleased version
+   header for user-visible changes.
+
+Bug reports, design discussion, and integration questions are all
+welcome in [GitHub Issues](https://github.com/RagavRida/agentsmcp/issues).
 
 ## License
 
