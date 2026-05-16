@@ -1,0 +1,29 @@
+# AWS App Runner service config. Used when the App Runner service is
+# created with "source code repository" mode pointing at this repo.
+#
+# Build: App Runner builds the Docker image from ./Dockerfile.
+# Runtime: container exposes port 8080; HTTPS is terminated by App Runner.
+#
+# Env vars to set in the App Runner console (NOT here — keep secrets
+# out of git):
+#   AGENTSMCP_API_KEY  required for the public demo, otherwise anyone
+#                      can write to the mailbox.
+#
+# Optional env vars (defaults are fine for a stateless demo):
+#   PORT              defaults to 8080.
+#   AGENTSMCP_DB      defaults to :memory: (wiped on restart). Set to
+#                     a writeable path if you mount persistent storage.
+version: 1.0
+runtime: docker
+build:
+  commands:
+    build: []
+run:
+  runtime-version: latest
+  command: node dist/server.js
+  network:
+    port: 8080
+    env: PORT
+  env:
+    - name: AGENTSMCP_DB
+      value: ":memory:"
