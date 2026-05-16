@@ -1,0 +1,21 @@
+{
+  "name": "agentsmcp-research-bench-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-agent research bench you can join from Claude Desktop. Shows cold-restart, cross-tool steering, and compression.",
+  "scripts": {
+    "demo": "ts-node src/start.ts",
+    "explorer": "ts-node src/explorer.ts",
+    "synthesizer": "ts-node src/synthesizer.ts",
+    "server": "ts-node --transpile-only -e \"import('agentsmcp').then(async m => { const { app, ready } = m.createServer(process.env.AGENTMAILBOX_DB ?? './bench.db'); await ready; app.listen(Number(process.env.PORT ?? 43500), () => console.log('[server] :' + (process.env.PORT ?? 43500))); })\""
+  },
+  "dependencies": {
+    "agentsmcp": "file:../..",
+    "@anthropic-ai/sdk": "^0.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  }
+}

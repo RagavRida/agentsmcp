@@ -127,8 +127,12 @@ npm run start &
 npx ts-node examples/multi-agent.ts
 ```
 
-For a real end-to-end demo with two long-running agents and a
-process restart, see [`examples/research-writer/`](./examples/research-writer/README.md).
+**The killer demo** — multi-agent research thread you can join from
+Claude Desktop, with cross-tool steering, cold-restart, and compression
+in action: [`examples/research-bench/`](./examples/research-bench/README.md).
+
+A minimal two-agent pipeline (no MCP, just SDK) is also available at
+[`examples/research-writer/`](./examples/research-writer/README.md).
 
 ## MCP adapter
 
