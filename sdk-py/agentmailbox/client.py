@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
 from urllib.parse import quote
 
@@ -170,14 +171,10 @@ class AgentMailbox:
         if from_agent is not None:
             frames = [f for f in frames if f.from_agent == from_agent]
         if frames:
-            last = frames[-1]
-            ctx = Context(
-                snapshot=last.context.snapshot,
-                thread_summary=last.context.thread_summary,
-                recent_messages=last.context.recent_messages,
-                token_count=last.context.token_count,
-                thread_summary_structured=last.context.thread_summary_structured,
-            )
+            # dataclasses.replace preserves every field (including any
+            # added later) instead of hand-picking — same shape-rot bug
+            # that bit the JS SDK in 0.3.0–0.3.2.
+            ctx = replace(frames[-1].context)
         else:
             ctx = Context(
                 snapshot={}, thread_summary="", recent_messages=[], token_count=0

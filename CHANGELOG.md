@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.5 — 2026-05-16
+
+### Fixed
+
+- **NoopCompressor lost message coverage across successive threshold
+  crossings.** The default compressor returned only the new batch in
+  `coversMessageIds` instead of unioning with the prior summary's
+  coverage. Effect: after the second compression on a thread, the
+  cache forgot earlier messages and triggered unnecessary
+  recompressions on every subsequent read. `ClaudeCompressor` was
+  already doing this correctly; only the default was wrong.
+- **JS SDK `receive()` was still hand-picking fields.** The 0.3.2 fix
+  added `tokenCount` and a conditional for `threadSummaryStructured`
+  but kept the field-list pattern, so any future optional field on
+  `ThreadContext` would silently drop again. Now uses
+  `{ ...last.context }` spread.
+
+### Added
+
+- Regression test exercising two threshold crossings with a read
+  between them — the only scenario in which the NoopCompressor
+  coverage bug manifests. Single-call tests can't reproduce it.
+
 ## 0.3.4 — 2026-05-16
 
 ### Changed

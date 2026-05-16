@@ -102,21 +102,16 @@ export class AgentMailbox {
     const filtered = from ? messages.filter((m) => m.from === from) : messages;
 
     const last = filtered[filtered.length - 1];
+    // Spread (not field-list) so any new optional field added to
+    // ThreadContext flows through without another SDK fix. The same
+    // pattern bit us three times in 0.3.0–0.3.2.
     const context: ReceiveResult["context"] = last
-      ? {
-          snapshot: last.context.snapshot,
-          threadSummary: last.context.threadSummary,
-          recentMessages: last.context.recentMessages,
-          tokenCount: last.context.tokenCount,
-        }
+      ? { ...last.context }
       : {
           snapshot: {},
           threadSummary: "",
           recentMessages: [] as Message[],
         };
-    if (last?.context.threadSummaryStructured) {
-      context.threadSummaryStructured = last.context.threadSummaryStructured;
-    }
 
     return { messages: filtered, context };
   }

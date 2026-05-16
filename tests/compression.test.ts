@@ -127,6 +127,50 @@ describe("assembleContext", () => {
     expect(ctx.threadSummaryStructured).toBeUndefined();
   });
 
+  it("NoopCompressor unions coversMessageIds across successive compressions", async () => {
+    // Regression: a previous version of NoopCompressor returned only the
+    // new batch in coversMessageIds, so the next read saw the original
+    // messages as "uncovered" again and re-triggered compression.
+    const t = await storage.createThread(["a@x", "b@x"]);
+    const noop = new NoopCompressor();
+
+    // 30 messages -> 20 older crosses threshold. Compress once.
+    const round1 = Array.from({ length: 30 }, (_, i) => makeMessage(t.id, i + 1));
+    await assembleContext(round1, {
+      threadId: t.id,
+      storage,
+      compressor: noop,
+    });
+    const after1 = await storage.getSummary(t.id);
+    expect(after1?.coversMessageIds.length).toBe(20);
+
+    // Add 20 more messages -> uncovered=20 again. Compress should run
+    // once and the resulting cache should cover 40, not 20.
+    const round2 = [
+      ...round1,
+      ...Array.from({ length: 20 }, (_, i) => makeMessage(t.id, 31 + i)),
+    ];
+    await assembleContext(round2, {
+      threadId: t.id,
+      storage,
+      compressor: noop,
+    });
+    const after2 = await storage.getSummary(t.id);
+    expect(after2?.coversMessageIds.length).toBe(40);
+
+    // Add one more message; uncovered=1 < threshold; compress must NOT
+    // run. Cache should still cover 40, not be regenerated.
+    const round3 = [...round2, makeMessage(t.id, 51)];
+    await assembleContext(round3, {
+      threadId: t.id,
+      storage,
+      compressor: noop,
+    });
+    const after3 = await storage.getSummary(t.id);
+    expect(after3?.coversMessageIds.length).toBe(40);
+    expect(after3?.generatedAt).toBe(after2?.generatedAt); // unchanged
+  });
+
   it("reuses cached summary and only compresses uncovered messages", async () => {
     const t = await storage.createThread(["a@x", "b@x"]);
     const seen: string[][] = [];
