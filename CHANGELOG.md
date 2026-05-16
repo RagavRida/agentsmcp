@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.4 — 2026-05-16
+
+### Changed
+
+- Server log prefix is now `[agentsmcp]` instead of `[agentmailbox]`
+  for consistency with the package name. Purely cosmetic; appears on
+  every server startup and in error logs.
+
 ## 0.3.3 — 2026-05-16
 
 ### Added

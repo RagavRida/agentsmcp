@@ -405,7 +405,7 @@ export function createServer(
   });
 
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    console.error("[agentmailbox] error:", err);
+    console.error("[agentsmcp] error:", err);
     res.status(500).json({ error: err.message ?? "internal error" });
   });
 
@@ -420,12 +420,12 @@ if (require.main === module) {
   ready
     .then(() => {
       app.listen(port, () => {
-        console.log(`[agentmailbox] server listening on http://localhost:${port}`);
-        console.log(`[agentmailbox] db: ${dbPath}`);
+        console.log(`[agentsmcp] server listening on http://localhost:${port}`);
+        console.log(`[agentsmcp] db: ${dbPath}`);
       });
     })
     .catch((e) => {
-      console.error("[agentmailbox] failed to initialize storage:", e);
+      console.error("[agentsmcp] failed to initialize storage:", e);
       process.exit(1);
     });
 }
