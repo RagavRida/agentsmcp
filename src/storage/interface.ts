@@ -91,8 +91,15 @@ export interface Storage {
 
   // ---------- Mailbox ----------
 
-  /** Returns an empty mailbox shape when the agent has no threads yet. */
-  getMailbox(agentId: AgentAddress): Promise<Mailbox>;
+  /**
+   * Returns an empty mailbox shape when the agent has no threads yet.
+   * @param opts.limit   Max threads to return (default 100).
+   * @param opts.offset  Offset for pagination (default 0).
+   */
+  getMailbox(
+    agentId: AgentAddress,
+    opts?: { limit?: number; offset?: number }
+  ): Promise<Mailbox & { total: number }>;
 
   /** Idempotent. No-op when the agent has no row for the thread. */
   markRead(agentId: AgentAddress, threadId: string): Promise<void>;
@@ -140,13 +147,17 @@ export interface Storage {
   ): Promise<void>;
 
   /**
-   * Keyword search on node name/description, then 2-hop graph traversal
+   * Keyword search on node name/description, then N-hop graph traversal
    * to pull connected entities. Returns the matched nodes and all edges
    * within the traversal radius.
+   *
+   * @param opts.limit  Cap total returned nodes (default 30, max 100).
+   * @param opts.depth  Traversal hop depth (default 2, max 5).
    */
   queryGraph(
     agentId: AgentAddress,
-    query: string
+    query: string,
+    opts?: { limit?: number; depth?: number }
   ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }>;
 
   // ---------- Codebase Index ----------
@@ -169,17 +180,122 @@ export interface Storage {
 
   /**
    * Keyword search across all index entries for an agent. Optionally
-   * filter by category. Returns entries whose key, summary, or metadata
-   * contain the query terms.
+   * filter by category. Returns entries whose key or summary contain
+   * the query terms.
+   *
+   * @param opts.limit  Max entries to return (default 50, max 200).
    */
   searchIndex(
     agentId: AgentAddress,
     query: string,
-    category?: string
+    category?: string,
+    opts?: { limit?: number }
   ): Promise<CodebaseIndexEntry[]>;
 
   /** Remove a single index entry. */
   deleteIndex(agentId: AgentAddress, key: string): Promise<void>;
+
+  /**
+   * Batch staleness check. For each { key, currentHash } entry, compares
+   * the provided hash against the stored contentHash. Returns three buckets:
+   *   - fresh: hash matches → caller may skip re-reading the file
+   *   - stale: hash differs → caller should re-read and re-index
+   *   - missing: no entry exists → caller must index from scratch
+   */
+  checkStaleness(
+    agentId: AgentAddress,
+    entries: Array<{ key: string; currentHash: string }>
+  ): Promise<StalenessResult>;
+
+  /**
+   * Aggregate file-level index entries into a module-level summary.
+   * Concatenates the summaries of all fileKeys into a single "module"
+   * category entry stored under moduleKey, and back-fills parentKey on
+   * every file entry.
+   */
+  rollupModule(
+    agentId: AgentAddress,
+    moduleKey: string,
+    fileKeys: string[]
+  ): Promise<void>;
+
+  // ---------- Git / Version Control ----------
+
+  /**
+   * Snapshot the agent's current graph (nodes + edges) and codebase index
+   * into an immutable commit. Each commit records its parent so the full
+   * history is a linked list. Adapters set `parentId` to the most recent
+   * commit on the same branch, or null if this is the first commit.
+   *
+   * @param opts.keepLast  After committing, prune old commits on this branch
+   *                       retaining only the N most recent. 0 = keep all.
+   */
+  createCommit(
+    agentId: AgentAddress,
+    message: string,
+    opts?: { branch?: string; keepLast?: number }
+  ): Promise<AgentCommit>;
+
+  /** Delete a single commit. The snapshot data is removed permanently. */
+  deleteCommit(agentId: AgentAddress, commitId: string): Promise<boolean>;
+
+  /**
+   * List commits for an agent, most recent first.
+   * @param opts.branch  Filter to a specific branch (default: all branches).
+   * @param opts.limit   Cap returned commits (default 20, max 100).
+   */
+  listCommits(
+    agentId: AgentAddress,
+    opts?: { branch?: string; limit?: number }
+  ): Promise<AgentCommit[]>;
+
+  /**
+   * Get a specific commit including its full snapshot payload.
+   * Returns null when the commit does not exist or belongs to a different agent.
+   */
+  getCommit(
+    agentId: AgentAddress,
+    commitId: string
+  ): Promise<(AgentCommit & { snapshot: CommitSnapshot }) | null>;
+
+  /**
+   * Destructively overwrite the agent's current graph + index with the
+   * state captured in the named commit. All current nodes, edges, and
+   * index entries are removed first. Atomic — either the full state lands
+   * or the original is preserved.
+   */
+  restoreCommit(agentId: AgentAddress, commitId: string): Promise<void>;
+
+  /**
+   * Diff two commits. Pass `null` for `toId` to diff against the agent's
+   * current live state. Returns three buckets for each domain (nodes,
+   * index): added, removed, and modified keys/ids.
+   */
+  diffCommits(
+    agentId: AgentAddress,
+    fromId: string,
+    toId: string | null
+  ): Promise<CommitDiff>;
+
+  /**
+   * Three-way merge: take the HEAD commit of `fromBranch` and combine it
+   * with the HEAD commit of `toBranch`, producing a new commit on `toBranch`.
+   *
+   * Strategies:
+   *   - "union"  (default): last-write-wins by updatedAt/content hash.
+   *              Nodes/entries present in either branch are included; on
+   *              conflict the one with the higher contentHash sort order wins.
+   *   - "ours":  `toBranch` wins all conflicts.
+   *   - "theirs": `fromBranch` wins all conflicts.
+   *
+   * Throws when either branch has no commits.
+   */
+  mergeCommits(
+    agentId: AgentAddress,
+    fromBranch: string,
+    toBranch: string,
+    opts?: { strategy?: "union" | "ours" | "theirs"; message?: string }
+  ): Promise<AgentCommit>;
 }
 
 // ---------- Context Graph types ----------
@@ -216,7 +332,9 @@ export type IndexCategory =
   | "symbol"
   | "api"
   | "config"
-  | "architecture";
+  | "architecture"
+  | "module"
+  | "overview";
 
 export interface CodebaseIndexEntry {
   key: string;
@@ -225,4 +343,61 @@ export interface CodebaseIndexEntry {
   /** Arbitrary extra data. Optional — not every entry needs it. */
   metadata?: Record<string, unknown>;
   updatedAt: number;
+  /** Parent module key, e.g. "module:auth" for a file entry. */
+  parentKey?: string;
+  /** SHA-256 of the raw file content at index time. Used for staleness checks. */
+  contentHash?: string;
+  /** AgentId that last created/updated this entry. */
+  indexedBy?: string;
+  /** True when the stored contentHash differs from the current file hash. */
+  stale?: boolean;
+}
+
+// ---------- Staleness types ----------
+
+export interface StalenessResult {
+  /** Keys whose stored contentHash matches the provided hash — safe to use cached summary. */
+  fresh: string[];
+  /** Keys whose hash differs — re-read the file and update the summary. */
+  stale: string[];
+  /** Keys that have no entry in the index at all — must be indexed from scratch. */
+  missing: string[];
+}
+
+// ---------- Git / Version Control ----------
+
+/** Hard caps on snapshot size to prevent runaway commit payloads. */
+export const MAX_COMMIT_NODES = 5000;
+export const MAX_COMMIT_INDEX_ENTRIES = 5000;
+
+/** Immutable snapshot of an agent's graph + index at a point in time. */
+export interface AgentCommit {
+  id: string;
+  agentId: string;
+  /** Parent commit id, or null for the root commit on a branch. */
+  parentId: string | null;
+  branch: string;
+  message: string;
+  nodeCount: number;
+  indexCount: number;
+  /** Short SHA-256 of the snapshot content — useful for quick equality checks. */
+  snapshotHash: string;
+  createdAt: number;
+}
+
+/** Full snapshot payload stored inside a commit. */
+export interface CommitSnapshot {
+  nodes: Array<Omit<GraphNode, "updatedAt">>;
+  edges: GraphEdge[];
+  indexEntries: Array<Omit<CodebaseIndexEntry, "updatedAt" | "stale">>;
+}
+
+/** What changed between two commits (or a commit and current live state). */
+export interface CommitDiff {
+  nodesAdded: string[];
+  nodesRemoved: string[];
+  nodesModified: string[];
+  indexAdded: string[];
+  indexRemoved: string[];
+  indexModified: string[];
 }

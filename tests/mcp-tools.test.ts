@@ -8,9 +8,9 @@ let server: TestServer;
 let agent: AgentMailbox;
 
 describe("MCP tools — listToolDefs", () => {
-  it("returns all 15 tool definitions with valid schemas", () => {
+  it("returns all 24 tool definitions with valid schemas", () => {
     const tools = listToolDefs();
-    expect(tools.length).toBe(15);
+    expect(tools.length).toBe(24);
 
     // Every tool has the expected shape
     for (const t of tools) {
@@ -27,15 +27,24 @@ describe("MCP tools — listToolDefs", () => {
     const names = listToolDefs().map((t) => t.name).sort();
     expect(names).toEqual([
       "agentsmcp_add_edge",
+      "agentsmcp_annotate_file",
+      "agentsmcp_check_staleness",
       "agentsmcp_context_briefing",
       "agentsmcp_get_index",
+      "agentsmcp_git_commit",
+      "agentsmcp_git_diff",
+      "agentsmcp_git_log",
+      "agentsmcp_git_restore",
       "agentsmcp_mark_read",
       "agentsmcp_participants",
+      "agentsmcp_post_edit_annotate",
       "agentsmcp_query_graph",
       "agentsmcp_receive",
       "agentsmcp_reply_all",
+      "agentsmcp_rollup_module",
       "agentsmcp_search_index",
       "agentsmcp_send",
+      "agentsmcp_session_start",
       "agentsmcp_sync",
       "agentsmcp_threads",
       "agentsmcp_unread",

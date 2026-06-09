@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { timingSafeEqual } from "crypto";
+import { randomBytes, timingSafeEqual } from "crypto";
 import { readFileSync } from "fs";
 import { join } from "path";
 import express, { Request, Response, NextFunction } from "express";
@@ -33,6 +33,7 @@ import {
   findOrCreateGitHubUser,
   signSession,
   verifySession,
+  UPGRADE_URL,
 } from "./cloud/auth";
 import { recordAudit, getAuditTrail } from "./cloud/audit";
 import { PostgresStorage } from "./storage/postgres";
@@ -63,6 +64,41 @@ const DEFAULT_CLOUD_CORS_ORIGINS = [
   "https://dashboard.agentsmcp.com",
   "https://agentsmcp.com",
 ];
+
+/** Parse a query-string integer with a guaranteed finite fallback. */
+function parseQueryInt(raw: unknown, def: number, min: number, max: number): number {
+  const n = Number(raw ?? def);
+  return Number.isFinite(n) ? Math.min(Math.max(min, n), max) : def;
+}
+
+/**
+ * True when `url` is a plain http://localhost or http://127.0.0.1 URL with no
+ * userinfo and no embedded credentials. Required to prevent /auth/github
+ * being abused as an open redirect via the cli_redirect param.
+ */
+export function isSafeLoopback(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:") return false;
+    if (u.username || u.password) return false;
+    const host = u.hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+/** Construct a loopback callback URL with a failure code. Used when CLI OAuth fails. */
+function buildCliFailureUrl(
+  cliRedirect: string,
+  code: string,
+  cliState: string | null
+): string {
+  const u = new URL(cliRedirect);
+  u.searchParams.set("error", code);
+  if (cliState) u.searchParams.set("state", cliState);
+  return u.toString();
+}
 
 let cachedPackageVersion: string | null = null;
 function getPackageVersion(): string {
@@ -333,29 +369,28 @@ export function createServer(
 
   app.use(express.json({ limit: "10mb" }));
 
-  // Structured JSON logger middleware.
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    const start = Date.now();
-    res.on("finish", () => {
-      const duration = Date.now() - start;
-      const log = {
-        timestamp: new Date().toISOString(),
-        type: "request",
-        method: req.method,
-        path: req.path,
-        ip: req.ip,
-        userAgent: req.headers["user-agent"] ?? null,
-        status: res.statusCode,
-        durationMs: duration,
-        userId: req.userId ?? null,
-        apiKeyId: req.apiKeyId ?? null,
-      };
-      if (cloudMode) {
-        console.log(JSON.stringify(log));
-      }
+  // Structured JSON logger middleware — only wired in cloudMode to avoid
+  // per-request closure overhead on self-hosted installs.
+  if (cloudMode) {
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      const start = Date.now();
+      res.on("finish", () => {
+        console.log(JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "request",
+          method: req.method,
+          path: req.path,
+          ip: req.ip,
+          userAgent: req.headers["user-agent"] ?? null,
+          status: res.statusCode,
+          durationMs: Date.now() - start,
+          userId: req.userId ?? null,
+          apiKeyId: req.apiKeyId ?? null,
+        }));
+      });
+      next();
     });
-    next();
-  });
+  }
 
   app.get("/health", (_req: Request, res: Response) => {
     res.json({ ok: true });
@@ -468,10 +503,35 @@ export function createServer(
       connect: async () => (await getPool()).connect(),
     };
 
+    // /auth/register rate limiter: max 10 registrations per IP per hour.
+    // In-memory only — resets on restart. Sufficient to block scripted
+    // account-factory attacks without a Redis dependency.
+    const registerAttempts = new Map<string, { count: number; windowStart: number }>();
+    const REGISTER_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+    const REGISTER_MAX = 10;
+    const registerRateLimit = (req: Request, res: Response, next: NextFunction) => {
+      const ip = (req.ip ?? req.socket.remoteAddress ?? "unknown").split(",")[0].trim();
+      const now = Date.now();
+      const entry = registerAttempts.get(ip);
+      if (!entry || now - entry.windowStart > REGISTER_WINDOW_MS) {
+        registerAttempts.set(ip, { count: 1, windowStart: now });
+        return next();
+      }
+      if (entry.count >= REGISTER_MAX) {
+        return res.status(429).json({
+          error: "rate_limit",
+          message: `Max ${REGISTER_MAX} registrations per IP per hour`,
+          retryAfterMs: REGISTER_WINDOW_MS - (now - entry.windowStart),
+        });
+      }
+      entry.count += 1;
+      return next();
+    };
+
     // /auth/register is intentionally registered BEFORE cloudAuth so signup
     // doesn't require a key. cloudAuth's skip-list also includes it as
     // defence-in-depth.
-    app.post("/auth/register", async (req: Request, res: Response, next: NextFunction) => {
+    app.post("/auth/register", registerRateLimit, async (req: Request, res: Response, next: NextFunction) => {
       try {
         const { email, name } = (req.body ?? {}) as {
           email?: string;
@@ -510,33 +570,51 @@ export function createServer(
 
     // GET /auth/github — kick off OAuth. State cookie defends against CSRF
     // on the callback (verified inside /auth/github/callback below).
-    app.get("/auth/github", (_req: Request, res: Response) => {
+    //
+    // Optional CLI-loopback flow:
+    //   ?cli_redirect=http://127.0.0.1:PORT/callback
+    //   ?cli_label=alice-laptop   (used as the new API key's display name)
+    //   ?cli_state=...            (echoed back to the CLI for its own CSRF check)
+    // When cli_redirect is present and points to a localhost address, the
+    // callback redirects there with the freshly-minted apiKey instead of the
+    // dashboard. Required by `agentsmcp init` for browser-based login.
+    app.get("/auth/github", (req: Request, res: Response) => {
       if (!githubReady) {
         return res.status(503).json({ error: "github_oauth_not_configured" });
       }
-      const state = require("crypto").randomBytes(24).toString("hex");
-      // 10-minute httpOnly cookie. Browsers only send it back to our same
-      // host on the callback, so it's a reliable CSRF defence even though
-      // we're cross-site from the frontend's perspective.
-      res.cookie?.("ghoauth_state", state, {
-        httpOnly: true,
-        secure: true,
-        sameSite: "lax",
-        maxAge: 10 * 60 * 1000,
-        path: "/auth/github",
-      });
-      // Express doesn't have res.cookie unless cookie-parser / setHeader is
-      // used. Fallback to manual Set-Header for compatibility.
+      const cliRedirect = (req.query.cli_redirect as string | undefined)?.trim();
+      const cliLabel = (req.query.cli_label as string | undefined)?.slice(0, 64);
+      const cliState = (req.query.cli_state as string | undefined)?.slice(0, 128);
+
+      if (cliRedirect && !isSafeLoopback(cliRedirect)) {
+        return res
+          .status(400)
+          .json({ error: "cli_redirect must be a http://localhost or http://127.0.0.1 URL" });
+      }
+
+      const rawState = randomBytes(24).toString("hex");
+      // GitHub echoes back `state` verbatim; we encode the CLI metadata into
+      // it so the callback can recover the loopback URL without trusting a
+      // cross-host cookie (which wouldn't reach a localhost callback anyway).
+      const githubState = cliRedirect
+        ? "cli." +
+          Buffer.from(
+            JSON.stringify({ s: rawState, c: cliRedirect, l: cliLabel ?? null, cs: cliState ?? null })
+          ).toString("base64url")
+        : rawState;
+
+      // Cookie still stores the raw state. The CSRF check happens against
+      // this cookie regardless of whether we used CLI mode.
       res.setHeader(
         "Set-Cookie",
-        `ghoauth_state=${state}; Max-Age=600; Path=/auth/github; HttpOnly; Secure; SameSite=Lax`
+        `ghoauth_state=${rawState}; Max-Age=600; Path=/auth/github; HttpOnly; Secure; SameSite=Lax`
       );
 
       const params = new URLSearchParams({
         client_id: githubClientId!,
         redirect_uri: githubCallbackUrl,
         scope: "read:user user:email",
-        state,
+        state: githubState,
         allow_signup: "true",
       });
       return res.redirect(
@@ -565,15 +643,41 @@ export function createServer(
             return res.redirect(`${frontendUrl}/?auth_error=missing_code`);
           }
 
-          // CSRF check: state cookie must match the state echoed back by GitHub.
+          // Decode the CLI metadata if present. Format: "cli." + base64url(JSON).
+          // Returns the raw CSRF state for the cookie comparison plus the
+          // optional CLI loopback URL + label + cli-side state.
+          let rawState: string | undefined = state;
+          let cliRedirect: string | null = null;
+          let cliLabel: string | null = null;
+          let cliState: string | null = null;
+          if (state && state.startsWith("cli.")) {
+            try {
+              const decoded = JSON.parse(
+                Buffer.from(state.slice(4), "base64url").toString("utf8")
+              ) as { s?: string; c?: string; l?: string | null; cs?: string | null };
+              if (typeof decoded.s === "string") rawState = decoded.s;
+              if (typeof decoded.c === "string" && isSafeLoopback(decoded.c)) {
+                cliRedirect = decoded.c;
+              }
+              if (typeof decoded.l === "string") cliLabel = decoded.l;
+              if (typeof decoded.cs === "string") cliState = decoded.cs;
+            } catch {
+              return res.redirect(`${frontendUrl}/?auth_error=bad_state`);
+            }
+          }
+
+          // CSRF check: state cookie must match the (decoded) raw state.
           const cookieHeader = req.headers.cookie ?? "";
           const stateCookie = cookieHeader
             .split(";")
             .map((c) => c.trim())
             .find((c) => c.startsWith("ghoauth_state="))
             ?.slice("ghoauth_state=".length);
-          if (!stateCookie || !state || stateCookie !== state) {
-            return res.redirect(`${frontendUrl}/?auth_error=state_mismatch`);
+          if (!stateCookie || !rawState || stateCookie !== rawState) {
+            const failUrl = cliRedirect
+              ? buildCliFailureUrl(cliRedirect, "state_mismatch", cliState)
+              : `${frontendUrl}/?auth_error=state_mismatch`;
+            return res.redirect(failUrl);
           }
 
           // Exchange code → access_token.
@@ -643,7 +747,7 @@ export function createServer(
             );
           }
 
-          const { userId, apiKey, isNew } = await findOrCreateGitHubUser(
+          const { userId, apiKey: signupKey, isNew } = await findOrCreateGitHubUser(
             cloudPool!,
             {
               githubId: ghUser.id,
@@ -662,7 +766,7 @@ export function createServer(
             action: "auth.login",
             resourceType: "user",
             resourceId: userId,
-            metadata: { method: "github", isNew },
+            metadata: { method: "github", isNew, cli: Boolean(cliRedirect) },
             ipAddress: req.ip,
             userAgent: req.headers["user-agent"] ?? null,
           });
@@ -673,11 +777,46 @@ export function createServer(
             "ghoauth_state=; Max-Age=0; Path=/auth/github; HttpOnly; Secure; SameSite=Lax"
           );
 
+          // CLI loopback flow: mint a labeled API key (for returning users) and
+          // redirect to the local callback. Each CLI install gets its own key
+          // so it can be revoked independently.
+          if (cliRedirect) {
+            let cliApiKey = signupKey;
+            if (!cliApiKey) {
+              try {
+                const minted = await createAdditionalKey(
+                  cloudPool!,
+                  userId,
+                  cliLabel ? `cli:${cliLabel}` : "cli"
+                );
+                cliApiKey = minted.apiKey;
+                recordAudit(cloudPool!, {
+                  userId,
+                  action: "key.create",
+                  resourceType: "api_key",
+                  resourceId: minted.keyId,
+                  metadata: { name: minted.name, via: "cli" },
+                  ipAddress: req.ip,
+                  userAgent: req.headers["user-agent"] ?? null,
+                });
+              } catch (e) {
+                const code =
+                  e instanceof AuthError ? e.code : "key_create_failed";
+                return res.redirect(buildCliFailureUrl(cliRedirect, code, cliState));
+              }
+            }
+            const cliUrl = new URL(cliRedirect);
+            cliUrl.searchParams.set("apiKey", cliApiKey!);
+            if (cliState) cliUrl.searchParams.set("state", cliState);
+            cliUrl.searchParams.set("githubLogin", ghUser.login);
+            return res.redirect(cliUrl.toString());
+          }
+
           const dashboardParams = new URLSearchParams({ token });
           // Only surface the freshly-minted API key on first-time signup so
           // the dashboard can show the one-time copy banner. Returning users
           // see their key list via /auth/keys after sign-in.
-          if (isNew && apiKey) dashboardParams.set("apiKey", apiKey);
+          if (isNew && signupKey) dashboardParams.set("apiKey", signupKey);
           return res.redirect(
             `${frontendUrl}/dashboard?${dashboardParams.toString()}`
           );
@@ -778,7 +917,8 @@ export function createServer(
           return res.status(401).json({ error: "session_expired" });
         }
 
-        const limit = Number(req.query.limit ?? 100);
+        const rawLimit = Number(req.query.limit ?? 100);
+        const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 1000)) : 100;
         const logs = await getAuditTrail(cloudPool!, payload.userId, limit);
         return res.status(200).json({ logs });
       } catch (e) {
@@ -857,7 +997,7 @@ export function createServer(
             resource: "api_keys",
             current: existing.length,
             limit: cap,
-            upgrade: "https://agentsmcp.com/pricing",
+            upgrade: UPGRADE_URL,
           });
         }
         const created = await createAdditionalKey(cloudPool!, req.userId, name || "default");
@@ -1123,12 +1263,14 @@ export function createServer(
     }
   });
 
-  // GET /mailbox/:agentId
+  // GET /mailbox/:agentId?limit=N&offset=M
   app.get("/mailbox/:agentId", async (req: Request, res: Response, next: NextFunction) => {
     try {
       const agentId = req.params.agentId;
       const s = storageFor(req);
-      const mailbox = await s.getMailbox(agentId);
+      const limit = parseQueryInt(req.query.limit, 100, 1, 1000);
+      const offset = parseQueryInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+      const mailbox = await s.getMailbox(agentId, { limit, offset });
       const threadsRaw = await Promise.all(
         mailbox.threads.map((tid) => s.getThread(tid))
       );
@@ -1138,6 +1280,9 @@ export function createServer(
       return res.status(200).json({
         threads,
         unreadCount: mailbox.unreadCount,
+        total: mailbox.total,
+        limit,
+        offset,
       });
     } catch (e) {
       next(e);
@@ -1149,12 +1294,7 @@ export function createServer(
     try {
       const agentId = req.params.agentId;
       const s = storageFor(req);
-      // ?recent=N — cap the verbatim message window to save tokens.
-      // Default 10 (historical). MCP callers should prefer 3-5.
-      const recentLimit = Math.min(
-        Math.max(1, Number(req.query.recent ?? 10)),
-        50 // hard ceiling to prevent abuse
-      );
+      const recentLimit = parseQueryInt(req.query.recent, 10, 1, 50);
       const unread = await s.getUnread(agentId);
       const frames: ContextFrame[] = await Promise.all(
         unread.map(async (m) => {
@@ -1245,11 +1385,7 @@ export function createServer(
       const thread = await s.getThread(req.params.threadId);
       if (!thread) return res.status(404).json({ error: "thread not found" });
       const requester = (req.query.as as string | undefined) ?? "";
-      // ?recent=N — cap the verbatim message window. Default 10.
-      const recentLimit = Math.min(
-        Math.max(1, Number(req.query.recent ?? 10)),
-        50
-      );
+      const recentLimit = parseQueryInt(req.query.recent, 10, 1, 50);
       const ctx = await assembleContext(thread.messages, {
         threadId: thread.id,
         storage: s,
@@ -1309,19 +1445,32 @@ export function createServer(
 
   // ===================== Context Graph =====================
 
+  const VALID_NODE_TYPES = new Set(["message", "file", "symbol", "decision", "task"]);
+
   // POST /mailbox/:agentId/graph/nodes — upsert a graph node
   app.post("/mailbox/:agentId/graph/nodes", async (req: Request, res: Response, next: NextFunction) => {
     try {
       const agentId = req.params.agentId;
-      const { id, type, name, description, metadata } = req.body;
-      if (!id || !type || !name) {
-        return res.status(400).json({ error: "id, type, and name are required" });
+      const { id, type, name, description, metadata } = req.body ?? {};
+      if (!id || typeof id !== "string") {
+        return res.status(400).json({ error: "id (string) is required" });
+      }
+      if (!type || !VALID_NODE_TYPES.has(type)) {
+        return res.status(400).json({
+          error: `type must be one of: ${[...VALID_NODE_TYPES].join(", ")}`,
+        });
+      }
+      if (!name || typeof name !== "string") {
+        return res.status(400).json({ error: "name (string) is required" });
+      }
+      if (metadata !== undefined && (typeof metadata !== "object" || Array.isArray(metadata))) {
+        return res.status(400).json({ error: "metadata must be a JSON object" });
       }
       await storageFor(req).upsertNode(agentId, {
         id,
         type,
         name,
-        description: description ?? undefined,
+        description: typeof description === "string" ? description : undefined,
         metadata: metadata ?? {},
       });
       return res.status(200).json({ ok: true, nodeId: id });
@@ -1333,23 +1482,28 @@ export function createServer(
   // POST /mailbox/:agentId/graph/edges — add a graph edge
   app.post("/mailbox/:agentId/graph/edges", async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { sourceId, targetId, type, weight } = req.body;
-      if (!sourceId || !targetId || !type) {
-        return res.status(400).json({ error: "sourceId, targetId, and type are required" });
+      const { sourceId, targetId, type, weight } = req.body ?? {};
+      if (!sourceId || typeof sourceId !== "string") {
+        return res.status(400).json({ error: "sourceId (string) is required" });
       }
-      await storageFor(req).addEdge({
-        sourceId,
-        targetId,
-        type,
-        weight: weight ?? 1.0,
-      });
+      if (!targetId || typeof targetId !== "string") {
+        return res.status(400).json({ error: "targetId (string) is required" });
+      }
+      if (!type || typeof type !== "string") {
+        return res.status(400).json({ error: "type (string) is required" });
+      }
+      const weightNum = weight !== undefined ? Number(weight) : 1.0;
+      if (!Number.isFinite(weightNum) || weightNum <= 0) {
+        return res.status(400).json({ error: "weight must be a positive finite number" });
+      }
+      await storageFor(req).addEdge({ sourceId, targetId, type, weight: weightNum });
       return res.status(200).json({ ok: true });
     } catch (e) {
       next(e);
     }
   });
 
-  // GET /mailbox/:agentId/graph/query?q=...&limit=N — keyword search + 2-hop traversal
+  // GET /mailbox/:agentId/graph/query?q=...&limit=N&depth=D — keyword search + N-hop traversal
   app.get("/mailbox/:agentId/graph/query", async (req: Request, res: Response, next: NextFunction) => {
     try {
       const agentId = req.params.agentId;
@@ -1357,34 +1511,195 @@ export function createServer(
       if (!q) {
         return res.status(400).json({ error: "q query parameter is required" });
       }
-      // ?limit=N — cap total nodes returned. Default 30, max 100.
-      const limit = Math.min(
-        Math.max(1, Number(req.query.limit ?? 30)),
-        100
-      );
-      const result = await storageFor(req).queryGraph(agentId, q);
-      // Apply limit after traversal (storage layer does the traversal;
-      // we slice here to avoid breaking the Storage interface contract).
-      const slicedNodes = result.nodes.slice(0, limit);
-      const nodeIds = new Set(slicedNodes.map((n) => n.id));
-      const slicedEdges = result.edges.filter(
-        (e) => nodeIds.has(e.sourceId) && nodeIds.has(e.targetId)
-      );
-      return res.status(200).json({ nodes: slicedNodes, edges: slicedEdges });
+      const limit = parseQueryInt(req.query.limit, 30, 1, 200);
+      const depth = parseQueryInt(req.query.depth, 2, 1, 5);
+      // Storage layer handles both limit and depth now
+      const result = await storageFor(req).queryGraph(agentId, q, { limit, depth });
+      return res.status(200).json(result);
     } catch (e) {
+      next(e);
+    }
+  });
+
+  // DELETE /mailbox/:agentId/graph/nodes/:nodeId
+  app.delete("/mailbox/:agentId/graph/nodes/:nodeId", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      await storageFor(req).deleteNode(req.params.agentId, req.params.nodeId);
+      return res.status(200).json({ ok: true });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // DELETE /mailbox/:agentId/graph/edges — body: { sourceId, targetId, type }
+  app.delete("/mailbox/:agentId/graph/edges", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { sourceId, targetId, type } = req.body ?? {};
+      if (!sourceId || !targetId || !type) {
+        return res.status(400).json({ error: "sourceId, targetId, and type are required" });
+      }
+      await storageFor(req).deleteEdge(sourceId, targetId, type);
+      return res.status(200).json({ ok: true });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ===================== Git / Version Control =====================
+
+  // POST /mailbox/:agentId/git/commit — snapshot current graph+index as a commit
+  // Body: { message, branch?, keepLast? }
+  app.post("/mailbox/:agentId/git/commit", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const agentId = req.params.agentId;
+      const { message, branch, keepLast } = (req.body ?? {}) as {
+        message?: string; branch?: string; keepLast?: number;
+      };
+      if (!message || typeof message !== "string") {
+        return res.status(400).json({ error: "message (string) is required" });
+      }
+      const keepLastNum = keepLast !== undefined ? Number(keepLast) : undefined;
+      if (keepLastNum !== undefined && (!Number.isFinite(keepLastNum) || keepLastNum < 1)) {
+        return res.status(400).json({ error: "keepLast must be a positive integer" });
+      }
+      const commit = await storageFor(req).createCommit(agentId, message, {
+        branch: branch ?? "main",
+        keepLast: keepLastNum,
+      });
+      return res.status(201).json(commit);
+    } catch (e) {
+      const err = e as Error & { status?: number };
+      if (err.status === 413) return res.status(413).json({ error: err.message });
+      next(e);
+    }
+  });
+
+  // DELETE /mailbox/:agentId/git/commits/:commitId
+  app.delete("/mailbox/:agentId/git/commits/:commitId", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const deleted = await storageFor(req).deleteCommit(req.params.agentId, req.params.commitId);
+      if (!deleted) return res.status(404).json({ error: "commit not found" });
+      return res.status(200).json({ ok: true });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // GET /mailbox/:agentId/git/log?branch=main&limit=20
+  app.get("/mailbox/:agentId/git/log", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const agentId = req.params.agentId;
+      const branch = req.query.branch as string | undefined;
+      const rawLimit = Number(req.query.limit ?? 20);
+      const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 100)) : 20;
+      const commits = await storageFor(req).listCommits(agentId, { branch, limit });
+      return res.status(200).json({ commits });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // GET /mailbox/:agentId/git/commits/:commitId — get single commit with full snapshot
+  app.get("/mailbox/:agentId/git/commits/:commitId", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const commit = await storageFor(req).getCommit(req.params.agentId, req.params.commitId);
+      if (!commit) return res.status(404).json({ error: "commit not found" });
+      return res.status(200).json(commit);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // POST /mailbox/:agentId/git/restore/:commitId — restore graph+index to a commit
+  app.post("/mailbox/:agentId/git/restore/:commitId", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      await storageFor(req).restoreCommit(req.params.agentId, req.params.commitId);
+      return res.status(200).json({ ok: true, restoredTo: req.params.commitId });
+    } catch (e) {
+      if ((e as Error)?.message?.includes("not found")) {
+        return res.status(404).json({ error: (e as Error).message });
+      }
+      next(e);
+    }
+  });
+
+  // POST /mailbox/:agentId/git/merge — merge fromBranch HEAD into toBranch
+  // Body: { fromBranch, toBranch, strategy?: "union"|"ours"|"theirs", message? }
+  app.post("/mailbox/:agentId/git/merge", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const agentId = req.params.agentId;
+      const { fromBranch, toBranch, strategy, message } = (req.body ?? {}) as {
+        fromBranch?: string; toBranch?: string;
+        strategy?: string; message?: string;
+      };
+      if (!fromBranch || typeof fromBranch !== "string") {
+        return res.status(400).json({ error: "fromBranch (string) is required" });
+      }
+      if (!toBranch || typeof toBranch !== "string") {
+        return res.status(400).json({ error: "toBranch (string) is required" });
+      }
+      const validStrategies = ["union", "ours", "theirs"];
+      if (strategy && !validStrategies.includes(strategy)) {
+        return res.status(400).json({ error: `strategy must be one of: ${validStrategies.join(", ")}` });
+      }
+      const commit = await storageFor(req).mergeCommits(agentId, fromBranch, toBranch, {
+        strategy: (strategy as "union" | "ours" | "theirs") ?? "union",
+        message: message ?? undefined,
+      });
+      return res.status(201).json(commit);
+    } catch (e) {
+      const err = e as Error & { status?: number };
+      if (err.message?.includes("has no commits")) {
+        return res.status(404).json({ error: err.message });
+      }
+      if (err.status === 413) return res.status(413).json({ error: err.message });
+      next(e);
+    }
+  });
+
+  // GET /mailbox/:agentId/git/diff?from=<commitId>&to=<commitId|"live">
+  // Omit `to` or pass `to=live` to diff against current live state.
+  app.get("/mailbox/:agentId/git/diff", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const agentId = req.params.agentId;
+      const fromId = req.query.from as string | undefined;
+      if (!fromId) return res.status(400).json({ error: "from query parameter is required" });
+      const toRaw = req.query.to as string | undefined;
+      const toId = toRaw && toRaw !== "live" ? toRaw : null;
+      const diff = await storageFor(req).diffCommits(agentId, fromId, toId);
+      return res.status(200).json(diff);
+    } catch (e) {
+      if ((e as Error)?.message?.includes("not found")) {
+        return res.status(404).json({ error: (e as Error).message });
+      }
       next(e);
     }
   });
 
   // ===================== Codebase Index =====================
 
+  const VALID_INDEX_CATEGORIES = new Set([
+    "file", "symbol", "api", "config", "architecture", "module", "overview",
+  ]);
+
   // POST /mailbox/:agentId/index — upsert an index entry
   app.post("/mailbox/:agentId/index", async (req: Request, res: Response, next: NextFunction) => {
     try {
       const agentId = req.params.agentId;
-      const { key, category, summary, metadata } = req.body;
-      if (!key || !category || !summary) {
-        return res.status(400).json({ error: "key, category, and summary are required" });
+      const { key, category, summary, metadata } = req.body ?? {};
+      if (!key || typeof key !== "string") {
+        return res.status(400).json({ error: "key (string) is required" });
+      }
+      if (!category || !VALID_INDEX_CATEGORIES.has(category)) {
+        return res.status(400).json({
+          error: `category must be one of: ${[...VALID_INDEX_CATEGORIES].join(", ")}`,
+        });
+      }
+      if (!summary || typeof summary !== "string") {
+        return res.status(400).json({ error: "summary (string) is required" });
+      }
+      if (metadata !== undefined && (typeof metadata !== "object" || Array.isArray(metadata))) {
+        return res.status(400).json({ error: "metadata must be a JSON object" });
       }
       await storageFor(req).upsertIndex(agentId, {
         key,
@@ -1416,17 +1731,17 @@ export function createServer(
     try {
       const agentId = req.params.agentId;
       const q = (req.query.q as string | undefined) ?? "";
-      const category = req.query.category as string | undefined;
       if (!q) {
         return res.status(400).json({ error: "q query parameter is required" });
       }
-      // ?limit=N — cap result count. Default 20, max 100.
-      const limit = Math.min(
-        Math.max(1, Number(req.query.limit ?? 20)),
-        100
-      );
-      const all = await storageFor(req).searchIndex(agentId, q, category);
-      const entries = all.slice(0, limit);
+      const categoryRaw = req.query.category as string | undefined;
+      if (categoryRaw && !VALID_INDEX_CATEGORIES.has(categoryRaw)) {
+        return res.status(400).json({
+          error: `category must be one of: ${[...VALID_INDEX_CATEGORIES].join(", ")}`,
+        });
+      }
+      const limit = parseQueryInt(req.query.limit, 20, 1, 200);
+      const entries = await storageFor(req).searchIndex(agentId, q, categoryRaw, { limit });
       return res.status(200).json({ entries });
     } catch (e) {
       next(e);
@@ -1440,6 +1755,61 @@ export function createServer(
       const key = req.params.key;
       await storageFor(req).deleteIndex(agentId, key);
       return res.status(200).json({ ok: true });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // POST /mailbox/:agentId/index/check-staleness — batch hash check
+  // Body: { entries: [{ key, currentHash }] }
+  // Returns: { fresh, stale, missing } — tells caller which summaries
+  // are still valid so it can skip reading unchanged files.
+  app.post("/mailbox/:agentId/index/check-staleness", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const agentId = req.params.agentId;
+      const entries = req.body?.entries;
+      if (!Array.isArray(entries)) {
+        return res.status(400).json({ error: "entries must be an array" });
+      }
+      if (entries.length > 500) {
+        return res.status(400).json({ error: `entries array too large (${entries.length}). Maximum is 500.` });
+      }
+      for (const e of entries) {
+        if (typeof e?.key !== "string" || typeof e?.currentHash !== "string") {
+          return res.status(400).json({ error: "each entry must have key (string) and currentHash (string)" });
+        }
+      }
+      const result = await storageFor(req).checkStaleness(agentId, entries);
+      return res.status(200).json(result);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // POST /mailbox/:agentId/index/rollup — aggregate file summaries into a module entry
+  // Body: { moduleKey, fileKeys }
+  // Returns: { ok, key, fileCount }
+  app.post("/mailbox/:agentId/index/rollup", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const agentId = req.params.agentId;
+      const { moduleKey, fileKeys } = req.body ?? {};
+      if (typeof moduleKey !== "string" || !moduleKey) {
+        return res.status(400).json({ error: "moduleKey is required (string)" });
+      }
+      if (!Array.isArray(fileKeys) || fileKeys.length === 0) {
+        return res.status(400).json({ error: "fileKeys must be a non-empty array" });
+      }
+      if (fileKeys.length > 500) {
+        return res.status(400).json({ error: `fileKeys array too large (${fileKeys.length}). Maximum is 500.` });
+      }
+      // Validate every item is a string
+      for (let i = 0; i < fileKeys.length; i++) {
+        if (typeof fileKeys[i] !== "string") {
+          return res.status(400).json({ error: `fileKeys[${i}] must be a string, got ${typeof fileKeys[i]}` });
+        }
+      }
+      await storageFor(req).rollupModule(agentId, moduleKey, fileKeys as string[]);
+      return res.status(200).json({ ok: true, key: moduleKey, fileCount: (fileKeys as string[]).length });
     } catch (e) {
       next(e);
     }

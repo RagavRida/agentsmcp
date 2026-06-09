@@ -75,9 +75,13 @@ const QueryGraphInput = z.object({
 
 const UpsertIndexInput = z.object({
   key: z.string().min(1).describe("Unique key, e.g. 'file:src/server.ts' or 'api:POST /messages/send'"),
-  category: z.enum(["file", "symbol", "api", "config", "architecture"]).describe("Entry category"),
+  category: z.enum(["file", "symbol", "api", "config", "architecture", "module", "overview"])
+    .describe("Entry category"),
   summary: z.string().min(1).describe("200-token max summary of this entry"),
   metadata: z.record(JsonValue).optional().describe("Arbitrary JSON metadata (exports, imports, line count, etc.)"),
+  contentHash: z.string().optional().describe("SHA-256 of the raw file content — enables staleness checks"),
+  parentKey: z.string().optional().describe("Parent module key, e.g. 'module:auth'"),
+  indexedBy: z.string().optional().describe("AgentId that created this entry"),
 });
 
 const GetIndexInput = z.object({
@@ -86,7 +90,8 @@ const GetIndexInput = z.object({
 
 const SearchIndexInput = z.object({
   query: z.string().min(1).describe("Search keywords"),
-  category: z.enum(["file", "symbol", "api", "config", "architecture"]).optional().describe("Optional category filter"),
+  category: z.enum(["file", "symbol", "api", "config", "architecture", "module", "overview"])
+    .optional().describe("Optional category filter"),
   limit: z.number().int().min(1).max(100).optional()
     .describe("Max results to return (default 20). Lower = fewer tokens."),
 });
@@ -307,8 +312,365 @@ const TOOL_DEFS: ToolDef[] = [
       return agent.searchIndex(args.query, args.category, { limit: args.limit });
     },
   },
+  {
+    name: "agentsmcp_check_staleness",
+    description:
+      "Batch-check which index summaries are still fresh. Call this at " +
+      "SESSION START with a list of { key, currentHash } pairs — one per " +
+      "file you plan to work with. Returns three buckets: " +
+      "fresh (use cached summary, skip reading the file), " +
+      "stale (re-read file and update the summary), " +
+      "missing (file not indexed yet — read and index it). " +
+      "This is the primary mechanism for avoiding redundant file reads.",
+    schema: z.object({
+      entries: z.array(
+        z.object({
+          key: z.string().describe("Index key, e.g. 'file:src/auth/middleware.ts'"),
+          currentHash: z.string().describe("SHA-256 of the current file content"),
+        })
+      ).min(1).describe("Files to check staleness for"),
+    }),
+    handler: async (agent, raw) => {
+      const { entries } = z.object({
+        entries: z.array(z.object({ key: z.string(), currentHash: z.string() })).min(1),
+      }).parse(raw);
+      return agent.checkStaleness(entries);
+    },
+  },
+  {
+    name: "agentsmcp_rollup_module",
+    description:
+      "Combine file-level index summaries into a single module-level entry. " +
+      "Call this after indexing a group of related files (e.g. all files in " +
+      "src/auth/). The module entry is stored under moduleKey and each file " +
+      "entry gets its parentKey set. Future sessions can read the module " +
+      "summary (~200 tokens) instead of loading each file individually.",
+    schema: z.object({
+      moduleKey: z.string().describe("Key for the module entry, e.g. 'module:auth'"),
+      fileKeys: z.array(z.string()).min(1).describe("Keys of the file entries to roll up"),
+    }),
+    handler: async (agent, raw) => {
+      const { moduleKey, fileKeys } = z.object({
+        moduleKey: z.string(),
+        fileKeys: z.array(z.string()).min(1),
+      }).parse(raw);
+      await agent.rollupModule(moduleKey, fileKeys);
+      return { ok: true, key: moduleKey, fileCount: fileKeys.length };
+    },
+  },
+
+  // ---------- Git / Version Control ----------
+
+  {
+    name: "agentsmcp_git_commit",
+    description:
+      "Snapshot the agent's current context graph and codebase index as an " +
+      "immutable commit. Call this at NATURAL CHECKPOINTS — after finishing a " +
+      "task, before a risky exploration, or at the end of a session. Each " +
+      "commit records a parent so you can trace history with agentsmcp_git_log. " +
+      "Use branch to isolate experimental work from 'main'.",
+    schema: z.object({
+      message: z.string().min(1).describe(
+        "Short description of what the agent accomplished, e.g. 'finished auth module analysis'"
+      ),
+      branch: z.string().optional().describe("Branch name (default 'main')"),
+      keepLast: z.number().int().min(1).max(200).optional().describe(
+        "After committing, prune old commits on this branch keeping only the N most recent. " +
+        "Omit to keep all commits."
+      ),
+    }),
+    handler: async (agent, raw) => {
+      const args = z.object({
+        message: z.string().min(1),
+        branch: z.string().optional(),
+        keepLast: z.number().int().min(1).max(200).optional(),
+      }).parse(raw);
+      return agent.gitCommit(args.message, { branch: args.branch, keepLast: args.keepLast });
+    },
+  },
+
+  {
+    name: "agentsmcp_git_log",
+    description:
+      "List the most recent commits for this agent, newest first. Returns id, " +
+      "message, branch, nodeCount, indexCount, snapshotHash, createdAt for " +
+      "each commit. Use to understand session history, find a checkpoint to " +
+      "restore, or verify that a commit landed.",
+    schema: z.object({
+      branch: z.string().optional().describe("Filter to one branch (default: all branches)"),
+      limit: z.number().int().min(1).max(100).optional()
+        .describe("Max commits to return (default 20)"),
+    }),
+    handler: async (agent, raw) => {
+      const args = z.object({
+        branch: z.string().optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      }).parse(raw);
+      const commits = await agent.gitLog({ branch: args.branch, limit: args.limit });
+      return { commits, count: commits.length };
+    },
+  },
+
+  {
+    name: "agentsmcp_git_restore",
+    description:
+      "Restore the agent's context graph and codebase index to the exact " +
+      "state captured in a previous commit. DESTRUCTIVE — all current nodes, " +
+      "edges, and index entries are replaced. Use after an exploration goes " +
+      "wrong, or to load a known-good checkpoint at the start of a new session. " +
+      "Get the commitId from agentsmcp_git_log first.",
+    schema: z.object({
+      commitId: z.string().min(1).describe("Commit id to restore to"),
+    }),
+    handler: async (agent, raw) => {
+      const { commitId } = z.object({ commitId: z.string().min(1) }).parse(raw);
+      return agent.gitRestore(commitId);
+    },
+  },
+
+  {
+    name: "agentsmcp_git_diff",
+    description:
+      "Show what changed between two commits, or between a commit and the " +
+      "current live state. Returns three buckets for graph nodes (added, " +
+      "removed, modified ids) and three for index entries. Useful for " +
+      "understanding what a session accomplished or verifying a restore.",
+    schema: z.object({
+      fromId: z.string().min(1).describe("Commit id to diff FROM (older)"),
+      toId: z.string().optional().describe(
+        "Commit id to diff TO (newer). Omit to compare against current live state."
+      ),
+    }),
+    handler: async (agent, raw) => {
+      const args = z.object({
+        fromId: z.string().min(1),
+        toId: z.string().optional(),
+      }).parse(raw);
+      return agent.gitDiff(args.fromId, args.toId);
+    },
+  },
+
+  // ---------- Annotations (context-as-comments) ----------
+
+  {
+    name: "agentsmcp_annotate_file",
+    description:
+      "Analyze a file and add structured @context JSDoc annotations to all " +
+      "exported functions, classes, and constants. Call this AFTER editing a " +
+      "file so future agents get instant context without reading other files. " +
+      "The annotations embed what-it-does, why, dependencies, and known " +
+      "gotchas directly in the source — pulled from this agent's graph + index.",
+    schema: z.object({
+      filePath: z.string().min(1).describe(
+        "Repo-relative path, e.g. 'src/auth/middleware.ts'. Used as the index key."
+      ),
+      source: z.string().describe("Current file contents."),
+    }),
+    handler: async (agent, raw) => {
+      const args = z.object({
+        filePath: z.string().min(1),
+        source: z.string(),
+      }).parse(raw);
+      const annotated = await agent.annotateFile(args.filePath, args.source);
+      return {
+        filePath: args.filePath,
+        annotated,
+        length: annotated.length,
+        skipped: annotated === args.source,
+      };
+    },
+  },
+
+  {
+    name: "agentsmcp_post_edit_annotate",
+    description:
+      "Update annotations after an edit. Refreshes @changed, @depends, @usedBy " +
+      "tags. Call this after every file modification so the next agent session " +
+      "doesn't burn tokens re-understanding your changes.",
+    schema: z.object({
+      filePath: z.string().min(1),
+      source: z.string(),
+      editSummary: z.string().min(1).describe(
+        "One-line description of what changed and why, e.g. " +
+        "'added retry logic to handle 429 responses'."
+      ),
+    }),
+    handler: async (agent, raw) => {
+      const args = z.object({
+        filePath: z.string().min(1),
+        source: z.string(),
+        editSummary: z.string().min(1),
+      }).parse(raw);
+      const annotated = await agent.postEditAnnotate(
+        args.filePath,
+        args.source,
+        args.editSummary
+      );
+      return {
+        filePath: args.filePath,
+        annotated,
+        length: annotated.length,
+        skipped: annotated === args.source,
+      };
+    },
+  },
 
   // ---------- Context Briefing ----------
+
+  {
+    name: "agentsmcp_session_start",
+    description:
+      "Get a complete session briefing before starting work. Combines " +
+      "architecture overview + relevant file summaries + graph decisions " +
+      "into a single payload. Call this FIRST at the start of every session. " +
+      "It tells you: what files are relevant, which summaries are stale " +
+      "(need re-reading), what architectural decisions apply, and similar " +
+      "past tasks. Costs ~5K-15K tokens instead of 200K+ from reading raw files. " +
+      "For quick mid-task lookups use agentsmcp_context_briefing instead.",
+    schema: z.object({
+      task: z.string().min(1).describe(
+        "What you are about to do, e.g. 'Add OAuth2 to the auth module'. " +
+        "Used to search for relevant files, decisions, and past tasks."
+      ),
+      files_hint: z.array(z.string()).max(50).optional().describe(
+        "Files you already know you will touch (from the user's open tabs, " +
+        "PR diff, etc.). Accepts bare paths ('src/auth/middleware.ts') or " +
+        "full keys ('file:src/auth/middleware.ts'). Duplicates are ignored."
+      ),
+      file_limit: z.number().int().min(1).max(50).optional().describe(
+        "Max file summaries to return from keyword search (default 15). " +
+        "Increase for broad explorations, decrease to save tokens."
+      ),
+      graph_limit: z.number().int().min(1).max(100).optional().describe(
+        "Max graph nodes to fetch (default 20). Increase if architectural " +
+        "context is sparse."
+      ),
+    }),
+    handler: async (agent, raw) => {
+      const args = z.object({
+        task: z.string().min(1),
+        files_hint: z.array(z.string()).max(50).optional(),
+        file_limit: z.number().int().min(1).max(50).optional(),
+        graph_limit: z.number().int().min(1).max(100).optional(),
+      }).parse(raw);
+
+      const fileLimit = args.file_limit ?? 15;
+      const graphLimit = args.graph_limit ?? 20;
+
+      // Build search query from task keywords.
+      // Filter words with length > 3 to skip stop-words; fall back to first
+      // 3 words of the raw task if everything is short (e.g. "Add DB").
+      const significantWords = args.task
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((w) => w.length > 3)
+        .slice(0, 6);
+      const searchQuery = significantWords.length > 0
+        ? significantWords.join(" ")
+        : args.task.toLowerCase().split(/\s+/).slice(0, 3).join(" ");
+
+      // Deduplicate files_hint and normalise to "file:" keys
+      const rawHints = args.files_hint ?? [];
+      const normHints = [...new Set(
+        rawHints
+          .map((h) => h.trim())
+          .filter(Boolean)
+          .map((h) => h.startsWith("file:") ? h : `file:${h}`)
+      )];
+
+      // 1. Fetch in parallel: overview, search results, hint lookups, graph
+      const architectureEntryPromise = agent
+        .getIndex("overview:architecture")
+        .catch(() => null);
+
+      const [architectureEntry, searchResults, hintResults, graphResult] = await Promise.all([
+        architectureEntryPromise,
+        agent.searchIndex(searchQuery, undefined, { limit: fileLimit })
+          .catch(() => [] as Awaited<ReturnType<typeof agent.searchIndex>>),
+        Promise.all(normHints.map((k) => agent.getIndex(k).catch(() => null))),
+        agent.queryGraph(searchQuery, { limit: graphLimit })
+          .catch(() => ({
+            nodes: [] as Awaited<ReturnType<typeof agent.queryGraph>>["nodes"],
+            edges: [] as Awaited<ReturnType<typeof agent.queryGraph>>["edges"],
+          })),
+      ]);
+
+      // 2. Merge hint lookups + search results, deduplicating by key.
+      //    Hints come first (they're more specific than keyword search).
+      const seen = new Set<string>();
+      const relevantFiles: Array<{
+        key: string;
+        summary: string;
+        stale?: boolean;
+        parentModule?: string;
+        contentHash?: string;
+      }> = [];
+
+      const validHints = hintResults.filter(
+        (e): e is NonNullable<typeof e> => e !== null
+      );
+
+      for (const entry of [...validHints, ...searchResults]) {
+        if (seen.has(entry.key)) continue;
+        seen.add(entry.key);
+        relevantFiles.push({
+          key: entry.key,
+          summary: entry.summary,
+          stale: entry.stale,
+          parentModule: entry.parentKey,
+          contentHash: entry.contentHash,
+        });
+      }
+
+      // 3. Decisions + relationships from graph
+      const relevantDecisions = graphResult.nodes
+        .filter((n: { type: string }) => n.type === "decision" || n.type === "task")
+        .map((n: { id: string; name: string; description?: string }) => ({
+          id: n.id,
+          name: n.name,
+          description: n.description,
+        }));
+
+      // Cap edges to avoid token bloat
+      const relationships = graphResult.edges.slice(0, 30);
+
+      // 4. Files the agent MUST actually read:
+      //    - stale entries (hash has changed since last indexing)
+      //    - hints that were not found in the index at all (not indexed yet)
+      const suggestedReads: string[] = [
+        ...relevantFiles.filter((f) => f.stale === true).map((f) => f.key),
+      ];
+      for (const key of normHints) {
+        if (!seen.has(key) && !suggestedReads.includes(key)) {
+          suggestedReads.push(key);
+        }
+      }
+
+      // 5. Token savings estimate.
+      //    Conservative avg: 3000 tokens/raw file (typical TS/Py file ~12KB).
+      //    Each cached summary is ~40 tokens.
+      //    Fresh files = ones we DON'T have to read raw.
+      const AVG_RAW_TOKENS_PER_FILE = 3000;
+      const AVG_SUMMARY_TOKENS_PER_FILE = 40;
+      const freshCount = relevantFiles.length - suggestedReads.length;
+      const tokensSaved = Math.max(0,
+        freshCount * (AVG_RAW_TOKENS_PER_FILE - AVG_SUMMARY_TOKENS_PER_FILE)
+      );
+
+      return {
+        architecture: architectureEntry?.summary ??
+          "No architecture overview yet. Run: agentsmcp-index --mode full --dir ./src",
+        relevantFiles,
+        relevantDecisions,
+        relationships,
+        suggestedReads,
+        tokensSaved,
+        tip: suggestedReads.length === 0
+          ? `All ${relevantFiles.length} relevant summaries are fresh — skip reading raw files.`
+          : `${suggestedReads.length} file(s) stale or missing. Read before editing: ${suggestedReads.slice(0, 5).join(", ")}${suggestedReads.length > 5 ? ` (+${suggestedReads.length - 5} more)` : ""}.`,
+      };
+    },
+  },
 
   {
     name: "agentsmcp_context_briefing",
@@ -323,18 +685,20 @@ const TOOL_DEFS: ToolDef[] = [
       const args = ContextBriefingInput.parse(raw);
       const task = args.task;
 
-      // Extract keywords from the task description (simple split)
-      const keywords = task
+      // Extract keywords — filter stop-words, fallback to raw first 3 words
+      const significantWords = task
         .toLowerCase()
         .split(/\s+/)
         .filter((w) => w.length > 3)
-        .slice(0, 5);
-      const searchQuery = keywords.join(" ");
+        .slice(0, 6);
+      const searchQuery = significantWords.length > 0
+        ? significantWords.join(" ")
+        : task.toLowerCase().split(/\s+/).slice(0, 3).join(" ");
 
-      // Query graph and index in parallel
+      // Query graph and index in parallel with explicit limits
       const [graphResult, indexEntries] = await Promise.all([
-        agent.queryGraph(searchQuery).catch(() => ({ nodes: [], edges: [] })),
-        agent.searchIndex(searchQuery).catch(() => []),
+        agent.queryGraph(searchQuery, { limit: 30 }).catch(() => ({ nodes: [], edges: [] })),
+        agent.searchIndex(searchQuery, undefined, { limit: 20 }).catch(() => []),
       ]);
 
       const briefing: Record<string, unknown> = {

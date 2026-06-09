@@ -571,6 +571,36 @@ JOIN plan_limits pl ON pl.plan = u.plan;
 
 
 -- ============================================================================
+-- Migration 005: agent git / version control (shipped in v0.4.x)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_commits (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  parent_id TEXT REFERENCES agent_commits(id),
+  branch TEXT NOT NULL DEFAULT 'main',
+  message TEXT NOT NULL DEFAULT '',
+  snapshot JSONB NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  node_count INTEGER NOT NULL DEFAULT 0,
+  index_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_commits_agent
+  ON agent_commits(agent_id, created_at DESC);
+
+-- ============================================================================
+-- Migration 006: thread participants_hash for TOCTOU prevention
+-- ============================================================================
+
+ALTER TABLE threads ADD COLUMN IF NOT EXISTS participants_hash TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_participants_hash
+  ON threads(participants_hash, user_id)
+  WHERE participants_hash IS NOT NULL;
+
+-- ============================================================================
 -- DONE
 -- ============================================================================
 -- 

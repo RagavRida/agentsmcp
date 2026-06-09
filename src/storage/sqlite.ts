@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import Database from "better-sqlite3";
 import { v4 as uuidv4 } from "uuid";
 import {
@@ -10,9 +11,15 @@ import {
   ThreadSummary,
 } from "../types";
 import {
+  AgentCommit,
   CodebaseIndexEntry,
+  CommitDiff,
+  CommitSnapshot,
   GraphEdge,
   GraphNode,
+  MAX_COMMIT_INDEX_ENTRIES,
+  MAX_COMMIT_NODES,
+  StalenessResult,
   Storage,
 } from "./interface";
 
@@ -120,22 +127,55 @@ export class SqliteStorage implements Storage {
       CREATE TABLE IF NOT EXISTS codebase_index (
         key TEXT NOT NULL,
         agent_id TEXT NOT NULL,
-        category TEXT NOT NULL CHECK (category IN ('file', 'symbol', 'api', 'config', 'architecture')),
+        category TEXT NOT NULL CHECK (category IN ('file', 'symbol', 'api', 'config', 'architecture', 'module', 'overview')),
         summary TEXT NOT NULL,
         metadata TEXT NOT NULL DEFAULT '{}',
+        parent_key TEXT,
+        content_hash TEXT,
+        indexed_by TEXT,
+        stale INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (key, agent_id)
       );
 
       CREATE INDEX IF NOT EXISTS idx_codebase_index_agent ON codebase_index(agent_id);
       CREATE INDEX IF NOT EXISTS idx_codebase_index_category ON codebase_index(agent_id, category);
+
+      CREATE TABLE IF NOT EXISTS agent_commits (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        parent_id TEXT REFERENCES agent_commits(id),
+        branch TEXT NOT NULL DEFAULT 'main',
+        message TEXT NOT NULL DEFAULT '',
+        snapshot TEXT NOT NULL,
+        snapshot_hash TEXT NOT NULL,
+        node_count INTEGER NOT NULL DEFAULT 0,
+        index_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(agent_id) REFERENCES agents(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_agent_commits_agent ON agent_commits(agent_id, created_at);
     `);
 
-    // Idempotent migration for older DBs created before CC/BCC support.
+    // Idempotent migrations
     this.ensureColumn("threads", "silent_participants", "TEXT NOT NULL DEFAULT '[]'");
+    // participants_hash unique constraint prevents concurrent duplicate thread creation
+    this.ensureColumn("threads", "participants_hash", "TEXT");
+    // Backfill existing rows
+    this.db.exec(`
+      UPDATE threads SET participants_hash = participants WHERE participants_hash IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_participants_hash
+        ON threads(participants_hash) WHERE participants_hash IS NOT NULL;
+    `);
     this.ensureColumn("messages", "cc", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("messages", "bcc", "TEXT NOT NULL DEFAULT '[]'");
     this.ensureColumn("messages", "reply_to", "TEXT");
+    // Index hierarchy + staleness columns (added in v0.5.0)
+    this.ensureColumn("codebase_index", "parent_key", "TEXT");
+    this.ensureColumn("codebase_index", "content_hash", "TEXT");
+    this.ensureColumn("codebase_index", "indexed_by", "TEXT");
+    this.ensureColumn("codebase_index", "stale", "INTEGER NOT NULL DEFAULT 0");
   }
 
   private ensureColumn(table: string, column: string, defSql: string): void {
@@ -195,14 +235,23 @@ export class SqliteStorage implements Storage {
     const silentJson = JSON.stringify(
       Array.from(new Set(silentParticipants)).sort()
     );
+    // INSERT OR IGNORE: under a concurrent race where two requests both see no
+    // existing thread and both try to create one, the second insert silently
+    // no-ops. The caller (server.ts) then re-queries and finds the winner.
     this.db
       .prepare(
-        `INSERT INTO threads (id, participants, silent_participants, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT OR IGNORE INTO threads
+           (id, participants, silent_participants, participants_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(id, visibleKey, silentJson, now, now);
+      .run(id, visibleKey, silentJson, visibleKey, now, now);
+    // If INSERT was ignored (race condition), read back the winning row
+    const winner = this.db
+      .prepare("SELECT id FROM threads WHERE participants_hash = ?")
+      .get(visibleKey) as { id: string } | undefined;
+    const actualId = winner?.id ?? id;
     return {
-      id,
+      id: actualId,
       participants: JSON.parse(visibleKey) as AgentAddress[],
       silentParticipants: JSON.parse(silentJson) as AgentAddress[],
       messages: [],
@@ -414,15 +463,27 @@ export class SqliteStorage implements Storage {
 
   // ---------- Mailbox ----------
 
-  async getMailbox(agentId: AgentAddress): Promise<Mailbox> {
+  async getMailbox(
+    agentId: AgentAddress,
+    opts?: { limit?: number; offset?: number }
+  ): Promise<Mailbox & { total: number }> {
+    const limit = Math.min(opts?.limit ?? 100, 1000);
+    const offset = Math.max(opts?.offset ?? 0, 0);
+
+    const totalRow = this.db
+      .prepare("SELECT COUNT(*) AS c FROM mailboxes WHERE agent_id = ?")
+      .get(agentId) as { c: number };
+    const total = totalRow.c;
+
     const rows = this.db
       .prepare(
-        "SELECT thread_id, unread_count FROM mailboxes WHERE agent_id = ?"
+        `SELECT thread_id, unread_count FROM mailboxes WHERE agent_id = ?
+         ORDER BY thread_id LIMIT ${limit} OFFSET ${offset}`
       )
       .all(agentId) as Array<{ thread_id: string; unread_count: number }>;
     const threads = rows.map((r) => r.thread_id);
     const unreadCount = rows.reduce((acc, r) => acc + r.unread_count, 0);
-    return { agentId, threads, unreadCount };
+    return { agentId, threads, unreadCount, total };
   }
 
   async markRead(agentId: AgentAddress, threadId: string): Promise<void> {
@@ -548,9 +609,13 @@ export class SqliteStorage implements Storage {
 
   async queryGraph(
     agentId: AgentAddress,
-    query: string
+    query: string,
+    opts?: { limit?: number; depth?: number }
   ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
     const pattern = `%${query}%`;
+    // Clamp caller-supplied values to safe ranges
+    const maxDepth = Math.min(Math.max(1, opts?.depth ?? 2), 5);
+    const nodeLimit = Math.min(Math.max(1, opts?.limit ?? 30), 200);
 
     // Step 1: Find seed nodes matching the query by name or description
     const seedRows = this.db
@@ -576,9 +641,11 @@ export class SqliteStorage implements Storage {
     const seedIds = seedRows.map((r) => r.id);
     const placeholders = seedIds.map(() => "?").join(", ");
 
-    // Step 2: 2-hop traversal — collect all node ids reachable within 2 edges
+    // Step 2: N-hop traversal — collect all node ids reachable within maxDepth edges
     const traversalRows = this.db
       .prepare(
+        // depth is a safe clamped integer — using template literal is intentional
+        // (better-sqlite3 does not support LIMIT/recursive-depth as bind params)
         `WITH RECURSIVE hops(node_id, depth) AS (
            SELECT id, 0 FROM graph_nodes WHERE id IN (${placeholders}) AND agent_id = ?
            UNION
@@ -588,9 +655,10 @@ export class SqliteStorage implements Storage {
            END, h.depth + 1
            FROM hops h
            JOIN graph_edges e ON (e.source_id = h.node_id OR e.target_id = h.node_id)
-           WHERE h.depth < 2
+           WHERE h.depth < ${maxDepth}
          )
-         SELECT DISTINCT node_id FROM hops`
+         SELECT DISTINCT node_id FROM hops
+         LIMIT ${nodeLimit}`
       )
       .all(...seedIds, agentId) as Array<{ node_id: string }>;
 
@@ -661,13 +729,19 @@ export class SqliteStorage implements Storage {
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO codebase_index (key, agent_id, category, summary, metadata, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO codebase_index
+           (key, agent_id, category, summary, metadata,
+            parent_key, content_hash, indexed_by, stale, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
          ON CONFLICT(key, agent_id) DO UPDATE SET
-           category = excluded.category,
-           summary = excluded.summary,
-           metadata = excluded.metadata,
-           updated_at = excluded.updated_at`
+           category     = excluded.category,
+           summary      = excluded.summary,
+           metadata     = excluded.metadata,
+           parent_key   = excluded.parent_key,
+           content_hash = excluded.content_hash,
+           indexed_by   = excluded.indexed_by,
+           stale        = 0,
+           updated_at   = excluded.updated_at`
       )
       .run(
         entry.key,
@@ -675,6 +749,9 @@ export class SqliteStorage implements Storage {
         entry.category,
         entry.summary,
         JSON.stringify(entry.metadata ?? {}),
+        entry.parentKey ?? null,
+        entry.contentHash ?? null,
+        entry.indexedBy ?? null,
         now
       );
   }
@@ -685,7 +762,8 @@ export class SqliteStorage implements Storage {
   ): Promise<CodebaseIndexEntry | null> {
     const row = this.db
       .prepare(
-        `SELECT key, category, summary, metadata, updated_at
+        `SELECT key, category, summary, metadata,
+                parent_key, content_hash, indexed_by, stale, updated_at
          FROM codebase_index WHERE key = ? AND agent_id = ?`
       )
       .get(key, agentId) as
@@ -694,26 +772,52 @@ export class SqliteStorage implements Storage {
           category: string;
           summary: string;
           metadata: string;
+          parent_key: string | null;
+          content_hash: string | null;
+          indexed_by: string | null;
+          stale: number;
           updated_at: number;
         }
       | undefined;
     if (!row) return null;
-    return {
+    return this.rowToIndexEntry(row);
+  }
+
+  private rowToIndexEntry(row: {
+    key: string;
+    category: string;
+    summary: string;
+    metadata: string;
+    parent_key?: string | null;
+    content_hash?: string | null;
+    indexed_by?: string | null;
+    stale?: number;
+    updated_at: number;
+  }): CodebaseIndexEntry {
+    const entry: CodebaseIndexEntry = {
       key: row.key,
       category: row.category as CodebaseIndexEntry["category"],
       summary: row.summary,
       metadata: JSON.parse(row.metadata) as Record<string, unknown>,
       updatedAt: row.updated_at,
     };
+    if (row.parent_key) entry.parentKey = row.parent_key;
+    if (row.content_hash) entry.contentHash = row.content_hash;
+    if (row.indexed_by) entry.indexedBy = row.indexed_by;
+    if (row.stale) entry.stale = Boolean(row.stale);
+    return entry;
   }
 
   async searchIndex(
     agentId: AgentAddress,
     query: string,
-    category?: string
+    category?: string,
+    opts?: { limit?: number }
   ): Promise<CodebaseIndexEntry[]> {
+    const resultLimit = Math.min(Math.max(1, opts?.limit ?? 50), 200);
     const pattern = `%${query}%`;
-    let sql = `SELECT key, category, summary, metadata, updated_at
+    let sql = `SELECT key, category, summary, metadata,
+                      parent_key, content_hash, indexed_by, stale, updated_at
                FROM codebase_index
                WHERE agent_id = ? AND (key LIKE ? OR summary LIKE ?)`;
     const params: unknown[] = [agentId, pattern, pattern];
@@ -721,22 +825,20 @@ export class SqliteStorage implements Storage {
       sql += " AND category = ?";
       params.push(category);
     }
-    sql += " ORDER BY updated_at DESC LIMIT 50";
+    sql += ` ORDER BY updated_at DESC LIMIT ${resultLimit}`;
 
     const rows = this.db.prepare(sql).all(...params) as Array<{
       key: string;
       category: string;
       summary: string;
       metadata: string;
+      parent_key: string | null;
+      content_hash: string | null;
+      indexed_by: string | null;
+      stale: number;
       updated_at: number;
     }>;
-    return rows.map((r) => ({
-      key: r.key,
-      category: r.category as CodebaseIndexEntry["category"],
-      summary: r.summary,
-      metadata: JSON.parse(r.metadata) as Record<string, unknown>,
-      updatedAt: r.updated_at,
-    }));
+    return rows.map((r) => this.rowToIndexEntry(r));
   }
 
   async deleteIndex(agentId: AgentAddress, key: string): Promise<void> {
@@ -745,7 +847,521 @@ export class SqliteStorage implements Storage {
       .run(key, agentId);
   }
 
+  async checkStaleness(
+    agentId: AgentAddress,
+    entries: Array<{ key: string; currentHash: string }>
+  ): Promise<StalenessResult> {
+    if (entries.length === 0) return { fresh: [], stale: [], missing: [] };
+
+    const hashMap = new Map(entries.map((e) => [e.key, e.currentHash]));
+    const keys = [...hashMap.keys()];
+    const placeholders = keys.map(() => "?").join(",");
+
+    const rows = this.db
+      .prepare(
+        `SELECT key, content_hash FROM codebase_index
+         WHERE agent_id = ? AND key IN (${placeholders})`
+      )
+      .all(agentId, ...keys) as Array<{ key: string; content_hash: string | null }>;
+
+    const found = new Map(rows.map((r) => [r.key, r.content_hash]));
+    const fresh: string[] = [];
+    const stale: string[] = [];
+    const missing: string[] = [];
+    const staleKeys: string[] = [];
+
+    for (const { key, currentHash } of entries) {
+      if (!found.has(key)) {
+        missing.push(key);
+      } else if (found.get(key) === currentHash) {
+        fresh.push(key);
+      } else {
+        stale.push(key);
+        staleKeys.push(key);
+      }
+    }
+
+    if (staleKeys.length > 0) {
+      const ph = staleKeys.map(() => "?").join(",");
+      this.db
+        .prepare(`UPDATE codebase_index SET stale = 1 WHERE agent_id = ? AND key IN (${ph})`)
+        .run(agentId, ...staleKeys);
+    }
+
+    return { fresh, stale, missing };
+  }
+
+  async rollupModule(
+    agentId: AgentAddress,
+    moduleKey: string,
+    fileKeys: string[]
+  ): Promise<void> {
+    const now = Date.now();
+    const summaryParts: string[] = [];
+
+    for (const key of fileKeys) {
+      const row = this.db
+        .prepare(
+          "SELECT summary FROM codebase_index WHERE key = ? AND agent_id = ?"
+        )
+        .get(key, agentId) as { summary: string } | undefined;
+      if (row) summaryParts.push(`[${key}] ${row.summary}`);
+    }
+
+    const combined = summaryParts.join("\n");
+
+    // Upsert the module entry
+    this.db
+      .prepare(
+        `INSERT INTO codebase_index
+           (key, agent_id, category, summary, metadata,
+            parent_key, content_hash, indexed_by, stale, updated_at)
+         VALUES (?, ?, 'module', ?, '{}', NULL, NULL, NULL, 0, ?)
+         ON CONFLICT(key, agent_id) DO UPDATE SET
+           summary    = excluded.summary,
+           stale      = 0,
+           updated_at = excluded.updated_at`
+      )
+      .run(moduleKey, agentId, combined, now);
+
+    // Back-fill parentKey on each file entry
+    for (const key of fileKeys) {
+      this.db
+        .prepare(
+          `UPDATE codebase_index SET parent_key = ?, updated_at = ?
+           WHERE key = ? AND agent_id = ?`
+        )
+        .run(moduleKey, now, key, agentId);
+    }
+  }
+
+  // ---------- Git / Version Control ----------
+
+  private captureSnapshot(agentId: AgentAddress): CommitSnapshot {
+    const nodeRows = this.db
+      .prepare(
+        `SELECT id, type, name, description, metadata FROM graph_nodes WHERE agent_id = ?`
+      )
+      .all(agentId) as Array<{
+        id: string; type: string; name: string;
+        description: string | null; metadata: string;
+      }>;
+
+    const nodeIds = nodeRows.map((r) => r.id);
+    let edgeRows: Array<{ source_id: string; target_id: string; type: string; weight: number }> = [];
+    if (nodeIds.length > 0) {
+      const ph = nodeIds.map(() => "?").join(",");
+      edgeRows = this.db
+        .prepare(
+          `SELECT source_id, target_id, type, weight FROM graph_edges
+           WHERE source_id IN (${ph}) AND target_id IN (${ph})`
+        )
+        .all(...nodeIds, ...nodeIds) as typeof edgeRows;
+    }
+
+    const indexRows = this.db
+      .prepare(
+        `SELECT key, category, summary, metadata, parent_key, content_hash
+         FROM codebase_index WHERE agent_id = ?`
+      )
+      .all(agentId) as Array<{
+        key: string; category: string; summary: string; metadata: string;
+        parent_key: string | null; content_hash: string | null;
+      }>;
+
+    return {
+      nodes: nodeRows.map((r) => ({
+        id: r.id,
+        type: r.type as GraphNode["type"],
+        name: r.name,
+        description: r.description ?? undefined,
+        metadata: JSON.parse(r.metadata) as Record<string, unknown>,
+      })),
+      edges: edgeRows.map((r) => ({
+        sourceId: r.source_id,
+        targetId: r.target_id,
+        type: r.type,
+        weight: r.weight,
+      })),
+      indexEntries: indexRows.map((r) => {
+        const entry: CommitSnapshot["indexEntries"][0] = {
+          key: r.key,
+          category: r.category as CodebaseIndexEntry["category"],
+          summary: r.summary,
+          metadata: JSON.parse(r.metadata) as Record<string, unknown>,
+        };
+        if (r.parent_key) entry.parentKey = r.parent_key;
+        if (r.content_hash) entry.contentHash = r.content_hash;
+        return entry;
+      }),
+    };
+  }
+
+  async createCommit(
+    agentId: AgentAddress,
+    message: string,
+    opts?: { branch?: string; keepLast?: number }
+  ): Promise<AgentCommit> {
+    const id = uuidv4();
+    const branch = opts?.branch ?? "main";
+    const createdAt = Date.now();
+    const snapshot = this.captureSnapshot(agentId);
+
+    if (snapshot.nodes.length > MAX_COMMIT_NODES) {
+      throw Object.assign(
+        new Error(`snapshot too large: ${snapshot.nodes.length} nodes exceeds limit of ${MAX_COMMIT_NODES}`),
+        { status: 413 }
+      );
+    }
+    if (snapshot.indexEntries.length > MAX_COMMIT_INDEX_ENTRIES) {
+      throw Object.assign(
+        new Error(`snapshot too large: ${snapshot.indexEntries.length} index entries exceeds limit of ${MAX_COMMIT_INDEX_ENTRIES}`),
+        { status: 413 }
+      );
+    }
+
+    const hashInput = JSON.stringify({
+      nodes: snapshot.nodes.map((n) => n.id).sort(),
+      index: snapshot.indexEntries.map((e) => e.key).sort(),
+    });
+    const snapshotHash = createHash("sha256").update(hashInput).digest("hex").slice(0, 16);
+
+    const parentRow = this.db
+      .prepare(
+        `SELECT id FROM agent_commits WHERE agent_id = ? AND branch = ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(agentId, branch) as { id: string } | undefined;
+
+    this.db
+      .prepare(
+        `INSERT INTO agent_commits
+           (id, agent_id, parent_id, branch, message, snapshot, snapshot_hash,
+            node_count, index_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id, agentId, parentRow?.id ?? null, branch, message,
+        JSON.stringify(snapshot), snapshotHash,
+        snapshot.nodes.length, snapshot.indexEntries.length, createdAt
+      );
+
+    if (opts?.keepLast && opts.keepLast > 0) {
+      const cutoff = this.db
+        .prepare(
+          `SELECT created_at FROM agent_commits
+           WHERE agent_id = ? AND branch = ?
+           ORDER BY created_at DESC LIMIT 1 OFFSET ?`
+        )
+        .get(agentId, branch, opts.keepLast - 1) as { created_at: number } | undefined;
+      if (cutoff) {
+        this.db
+          .prepare(
+            `DELETE FROM agent_commits
+             WHERE agent_id = ? AND branch = ? AND created_at < ?`
+          )
+          .run(agentId, branch, cutoff.created_at);
+      }
+    }
+
+    return {
+      id, agentId, parentId: parentRow?.id ?? null, branch, message,
+      nodeCount: snapshot.nodes.length, indexCount: snapshot.indexEntries.length,
+      snapshotHash, createdAt,
+    };
+  }
+
+  async deleteCommit(agentId: AgentAddress, commitId: string): Promise<boolean> {
+    const result = this.db
+      .prepare("DELETE FROM agent_commits WHERE id = ? AND agent_id = ?")
+      .run(commitId, agentId);
+    return result.changes > 0;
+  }
+
+  async listCommits(
+    agentId: AgentAddress,
+    opts?: { branch?: string; limit?: number }
+  ): Promise<AgentCommit[]> {
+    const limit = Math.min(opts?.limit ?? 20, 100);
+    const params: unknown[] = [agentId];
+    let sql = `SELECT id, agent_id, parent_id, branch, message, snapshot_hash,
+                      node_count, index_count, created_at
+               FROM agent_commits WHERE agent_id = ?`;
+    if (opts?.branch) {
+      sql += " AND branch = ?";
+      params.push(opts.branch);
+    }
+    sql += ` ORDER BY created_at DESC LIMIT ${limit}`;
+
+    const rows = this.db.prepare(sql).all(...params) as Array<{
+      id: string; agent_id: string; parent_id: string | null; branch: string;
+      message: string; snapshot_hash: string; node_count: number;
+      index_count: number; created_at: number;
+    }>;
+    return rows.map((r) => ({
+      id: r.id, agentId: r.agent_id, parentId: r.parent_id, branch: r.branch,
+      message: r.message, snapshotHash: r.snapshot_hash,
+      nodeCount: r.node_count, indexCount: r.index_count, createdAt: r.created_at,
+    }));
+  }
+
+  async getCommit(
+    agentId: AgentAddress,
+    commitId: string
+  ): Promise<(AgentCommit & { snapshot: CommitSnapshot }) | null> {
+    const row = this.db
+      .prepare(
+        `SELECT id, agent_id, parent_id, branch, message, snapshot, snapshot_hash,
+                node_count, index_count, created_at
+         FROM agent_commits WHERE id = ? AND agent_id = ?`
+      )
+      .get(commitId, agentId) as
+      | {
+          id: string; agent_id: string; parent_id: string | null;
+          branch: string; message: string; snapshot: string;
+          snapshot_hash: string; node_count: number; index_count: number;
+          created_at: number;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      id: row.id, agentId: row.agent_id, parentId: row.parent_id,
+      branch: row.branch, message: row.message, snapshotHash: row.snapshot_hash,
+      nodeCount: row.node_count, indexCount: row.index_count, createdAt: row.created_at,
+      snapshot: JSON.parse(row.snapshot) as CommitSnapshot,
+    };
+  }
+
+  async restoreCommit(agentId: AgentAddress, commitId: string): Promise<void> {
+    const row = this.db
+      .prepare(`SELECT snapshot FROM agent_commits WHERE id = ? AND agent_id = ?`)
+      .get(commitId, agentId) as { snapshot: string } | undefined;
+    if (!row) throw new Error(`commit ${commitId} not found`);
+    const snapshot = JSON.parse(row.snapshot) as CommitSnapshot;
+
+    const tx = this.db.transaction(() => {
+      const now = Date.now();
+      const existingIds = (
+        this.db
+          .prepare(`SELECT id FROM graph_nodes WHERE agent_id = ?`)
+          .all(agentId) as Array<{ id: string }>
+      ).map((r) => r.id);
+      if (existingIds.length > 0) {
+        const ph = existingIds.map(() => "?").join(",");
+        this.db
+          .prepare(`DELETE FROM graph_edges WHERE source_id IN (${ph}) OR target_id IN (${ph})`)
+          .run(...existingIds, ...existingIds);
+      }
+      this.db.prepare(`DELETE FROM graph_nodes WHERE agent_id = ?`).run(agentId);
+      this.db.prepare(`DELETE FROM codebase_index WHERE agent_id = ?`).run(agentId);
+
+      for (const n of snapshot.nodes) {
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO graph_nodes
+               (id, agent_id, type, name, description, metadata, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(n.id, agentId, n.type, n.name, n.description ?? null,
+            JSON.stringify(n.metadata ?? {}), now);
+      }
+      for (const e of snapshot.edges) {
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO graph_edges (source_id, target_id, type, weight)
+             VALUES (?, ?, ?, ?)`
+          )
+          .run(e.sourceId, e.targetId, e.type, e.weight ?? 1.0);
+      }
+      for (const entry of snapshot.indexEntries) {
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO codebase_index
+               (key, agent_id, category, summary, metadata,
+                parent_key, content_hash, indexed_by, stale, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)`
+          )
+          .run(
+            entry.key, agentId, entry.category, entry.summary,
+            JSON.stringify(entry.metadata ?? {}),
+            entry.parentKey ?? null, entry.contentHash ?? null, now
+          );
+      }
+    });
+    tx();
+  }
+
+  async diffCommits(
+    agentId: AgentAddress,
+    fromId: string,
+    toId: string | null
+  ): Promise<CommitDiff> {
+    const fromRow = this.db
+      .prepare(`SELECT snapshot FROM agent_commits WHERE id = ? AND agent_id = ?`)
+      .get(fromId, agentId) as { snapshot: string } | undefined;
+    if (!fromRow) throw new Error(`commit ${fromId} not found`);
+    const fromSnap = JSON.parse(fromRow.snapshot) as CommitSnapshot;
+
+    let toSnap: CommitSnapshot;
+    if (toId) {
+      const toRow = this.db
+        .prepare(`SELECT snapshot FROM agent_commits WHERE id = ? AND agent_id = ?`)
+        .get(toId, agentId) as { snapshot: string } | undefined;
+      if (!toRow) throw new Error(`commit ${toId} not found`);
+      toSnap = JSON.parse(toRow.snapshot) as CommitSnapshot;
+    } else {
+      toSnap = this.captureSnapshot(agentId);
+    }
+
+    return computeCommitDiff(fromSnap, toSnap);
+  }
+
+  async mergeCommits(
+    agentId: AgentAddress,
+    fromBranch: string,
+    toBranch: string,
+    opts?: { strategy?: "union" | "ours" | "theirs"; message?: string }
+  ): Promise<AgentCommit> {
+    const strategy = opts?.strategy ?? "union";
+    const fromRow = this.db
+      .prepare(
+        `SELECT snapshot FROM agent_commits WHERE agent_id = ? AND branch = ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(agentId, fromBranch) as { snapshot: string } | undefined;
+    if (!fromRow) throw new Error(`branch '${fromBranch}' has no commits`);
+
+    const toRow = this.db
+      .prepare(
+        `SELECT snapshot FROM agent_commits WHERE agent_id = ? AND branch = ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(agentId, toBranch) as { snapshot: string } | undefined;
+    if (!toRow) throw new Error(`branch '${toBranch}' has no commits`);
+
+    // Merge: ours = toBranch (what we're merging into), theirs = fromBranch
+    const merged = mergeSnapshots(
+      JSON.parse(toRow.snapshot) as CommitSnapshot,
+      JSON.parse(fromRow.snapshot) as CommitSnapshot,
+      strategy
+    );
+
+    // Apply merged state as live state so createCommit captures it correctly
+    const tx = this.db.transaction(() => {
+      const now = Date.now();
+      const existingIds = (
+        this.db.prepare(`SELECT id FROM graph_nodes WHERE agent_id = ?`).all(agentId) as Array<{ id: string }>
+      ).map((r) => r.id);
+      if (existingIds.length > 0) {
+        const ph = existingIds.map(() => "?").join(",");
+        this.db.prepare(`DELETE FROM graph_edges WHERE source_id IN (${ph}) OR target_id IN (${ph})`).run(...existingIds, ...existingIds);
+      }
+      this.db.prepare(`DELETE FROM graph_nodes WHERE agent_id = ?`).run(agentId);
+      this.db.prepare(`DELETE FROM codebase_index WHERE agent_id = ?`).run(agentId);
+      for (const n of merged.nodes) {
+        this.db.prepare(
+          `INSERT OR REPLACE INTO graph_nodes (id, agent_id, type, name, description, metadata, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(n.id, agentId, n.type, n.name, n.description ?? null, JSON.stringify(n.metadata ?? {}), now);
+      }
+      for (const e of merged.edges) {
+        this.db.prepare(
+          `INSERT OR REPLACE INTO graph_edges (source_id, target_id, type, weight) VALUES (?, ?, ?, ?)`
+        ).run(e.sourceId, e.targetId, e.type, e.weight ?? 1.0);
+      }
+      for (const entry of merged.indexEntries) {
+        this.db.prepare(
+          `INSERT OR REPLACE INTO codebase_index (key, agent_id, category, summary, metadata, parent_key, content_hash, indexed_by, stale, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)`
+        ).run(entry.key, agentId, entry.category, entry.summary, JSON.stringify(entry.metadata ?? {}), entry.parentKey ?? null, entry.contentHash ?? null, now);
+      }
+    });
+    tx();
+
+    const mergeMsg = opts?.message ?? `Merge '${fromBranch}' into '${toBranch}' (${strategy})`;
+    return this.createCommit(agentId, mergeMsg, { branch: toBranch });
+  }
+
   async close(): Promise<void> {
     this.db.close();
   }
+}
+
+function mergeSnapshots(
+  ours: CommitSnapshot,
+  theirs: CommitSnapshot,
+  strategy: "union" | "ours" | "theirs"
+): CommitSnapshot {
+  if (strategy === "ours") return ours;
+  if (strategy === "theirs") return theirs;
+
+  // union: include all; on id/key conflict pick one deterministically
+  const nodeMap = new Map<string, CommitSnapshot["nodes"][0]>();
+  for (const n of ours.nodes) nodeMap.set(n.id, n);
+  for (const n of theirs.nodes) {
+    if (!nodeMap.has(n.id)) {
+      nodeMap.set(n.id, n);
+    } else {
+      // deterministic tie-break: sort by JSON stringification so same input → same output
+      const cur = nodeMap.get(n.id)!;
+      if (JSON.stringify(n) > JSON.stringify(cur)) nodeMap.set(n.id, n);
+    }
+  }
+
+  const edgeKey = (e: GraphEdge) => `${e.sourceId}|${e.targetId}|${e.type}`;
+  const edgeMap = new Map<string, GraphEdge>();
+  for (const e of [...ours.edges, ...theirs.edges]) edgeMap.set(edgeKey(e), e);
+  const validNodeIds = new Set(nodeMap.keys());
+  const edges = [...edgeMap.values()].filter(
+    (e) => validNodeIds.has(e.sourceId) && validNodeIds.has(e.targetId)
+  );
+
+  const indexMap = new Map<string, CommitSnapshot["indexEntries"][0]>();
+  for (const e of ours.indexEntries) indexMap.set(e.key, e);
+  for (const e of theirs.indexEntries) {
+    if (!indexMap.has(e.key)) {
+      indexMap.set(e.key, e);
+    } else {
+      const cur = indexMap.get(e.key)!;
+      if (JSON.stringify(e) > JSON.stringify(cur)) indexMap.set(e.key, e);
+    }
+  }
+
+  return {
+    nodes: [...nodeMap.values()],
+    edges,
+    indexEntries: [...indexMap.values()],
+  };
+}
+
+function computeCommitDiff(from: CommitSnapshot, to: CommitSnapshot): CommitDiff {
+  const fromNodes = new Map(from.nodes.map((n) => [n.id, n]));
+  const toNodes = new Map(to.nodes.map((n) => [n.id, n]));
+  const fromIndex = new Map(from.indexEntries.map((e) => [e.key, e]));
+  const toIndex = new Map(to.indexEntries.map((e) => [e.key, e]));
+
+  const nodesAdded = [...toNodes.keys()].filter((k) => !fromNodes.has(k));
+  const nodesRemoved = [...fromNodes.keys()].filter((k) => !toNodes.has(k));
+  const nodesModified = [...fromNodes.keys()].filter((k) => {
+    const a = fromNodes.get(k)!;
+    const b = toNodes.get(k);
+    if (!b) return false;
+    return (
+      a.name !== b.name ||
+      a.description !== b.description ||
+      JSON.stringify(a.metadata) !== JSON.stringify(b.metadata)
+    );
+  });
+
+  const indexAdded = [...toIndex.keys()].filter((k) => !fromIndex.has(k));
+  const indexRemoved = [...fromIndex.keys()].filter((k) => !toIndex.has(k));
+  const indexModified = [...fromIndex.keys()].filter((k) => {
+    const a = fromIndex.get(k)!;
+    const b = toIndex.get(k);
+    if (!b) return false;
+    return (
+      a.summary !== b.summary ||
+      JSON.stringify(a.metadata) !== JSON.stringify(b.metadata)
+    );
+  });
+
+  return { nodesAdded, nodesRemoved, nodesModified, indexAdded, indexRemoved, indexModified };
 }

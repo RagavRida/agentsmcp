@@ -2,6 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 import { AgentMailbox } from "../agentmailbox";
+import { parseInitArgv, runInit } from "../cli/init";
 
 import { buildMcpServer } from "./server";
 
@@ -36,8 +37,13 @@ function parseArgs(argv: string[]): Partial<Config> {
 
 function printUsage(): void {
   process.stderr.write(
-    "usage: agentsmcp [--agent-id ID] [--server URL] [--api-key KEY]\n" +
-      "env: AGENTSMCP_AGENT_ID, AGENTSMCP_SERVER, AGENTSMCP_API_KEY\n"
+    "usage:\n" +
+      "  agentsmcp init [options]                 one-command MCP client setup\n" +
+      "  agentsmcp [--agent-id ID] [--server URL] [--api-key KEY]\n" +
+      "                                           start the MCP server (stdio)\n" +
+      "\n" +
+      "env: AGENTSMCP_AGENT_ID, AGENTSMCP_SERVER, AGENTSMCP_API_KEY\n" +
+      "Run `agentsmcp init --help` for setup flags.\n"
   );
 }
 
@@ -72,6 +78,15 @@ function resolveConfig(): Config {
 }
 
 async function main(): Promise<void> {
+  // Subcommand dispatch — keeps `agentsmcp` (no args) starting the MCP server
+  // for backward compatibility while exposing `agentsmcp init` for setup.
+  const sub = process.argv[2];
+  if (sub === "init") {
+    const initArgs = parseInitArgv(process.argv.slice(3));
+    await runInit(initArgs);
+    return;
+  }
+
   const cfg = resolveConfig();
   const agent = new AgentMailbox({
     agentId: cfg.agentId,

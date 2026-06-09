@@ -82,6 +82,8 @@ export interface Mailbox {
   agentId: AgentAddress;
   threads: string[];
   unreadCount: number;
+  /** Total thread count for this agent (before pagination). */
+  total: number;
 }
 
 export interface SendOptions {

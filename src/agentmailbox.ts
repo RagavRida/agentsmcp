@@ -9,9 +9,13 @@ import {
   ThreadSummary,
 } from "./types";
 import type {
+  AgentCommit,
   CodebaseIndexEntry,
+  CommitDiff,
+  CommitSnapshot,
   GraphEdge,
   GraphNode,
+  StalenessResult,
 } from "./storage/interface";
 
 export interface AgentMailboxConfig {
@@ -212,10 +216,11 @@ export class AgentMailbox {
 
   async queryGraph(
     query: string,
-    opts: { limit?: number } = {}
+    opts: { limit?: number; depth?: number } = {}
   ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
     let path = `/mailbox/${encodeURIComponent(this.agentId)}/graph/query?q=${encodeURIComponent(query)}`;
     if (opts.limit != null) path += `&limit=${opts.limit}`;
+    if (opts.depth != null) path += `&depth=${opts.depth}`;
     return this.request<{ nodes: GraphNode[]; edges: GraphEdge[] }>("GET", path);
   }
 
@@ -253,14 +258,132 @@ export class AgentMailbox {
     const res = await this.request<{ entries: CodebaseIndexEntry[] }>("GET", path);
     return res.entries;
   }
+
+  async checkStaleness(
+    entries: Array<{ key: string; currentHash: string }>
+  ): Promise<StalenessResult> {
+    return this.request<StalenessResult>(
+      "POST",
+      `/mailbox/${encodeURIComponent(this.agentId)}/index/check-staleness`,
+      { entries }
+    );
+  }
+
+  async rollupModule(
+    moduleKey: string,
+    fileKeys: string[]
+  ): Promise<void> {
+    await this.request<{ ok: boolean }>(
+      "POST",
+      `/mailbox/${encodeURIComponent(this.agentId)}/index/rollup`,
+      { moduleKey, fileKeys }
+    );
+  }
+
+  // ---------- Git / Version Control ----------
+
+  async gitCommit(
+    message: string,
+    opts?: { branch?: string; keepLast?: number }
+  ): Promise<AgentCommit> {
+    return this.request<AgentCommit>(
+      "POST",
+      `/mailbox/${encodeURIComponent(this.agentId)}/git/commit`,
+      { message, branch: opts?.branch, keepLast: opts?.keepLast }
+    );
+  }
+
+  async gitLog(opts?: { branch?: string; limit?: number }): Promise<AgentCommit[]> {
+    let path = `/mailbox/${encodeURIComponent(this.agentId)}/git/log`;
+    const params = new URLSearchParams();
+    if (opts?.branch) params.set("branch", opts.branch);
+    if (opts?.limit != null) params.set("limit", String(opts.limit));
+    if ([...params].length) path += `?${params.toString()}`;
+    const { commits } = await this.request<{ commits: AgentCommit[] }>("GET", path);
+    return commits;
+  }
+
+  async getCommit(
+    commitId: string
+  ): Promise<(AgentCommit & { snapshot: CommitSnapshot }) | null> {
+    try {
+      return await this.request<AgentCommit & { snapshot: CommitSnapshot }>(
+        "GET",
+        `/mailbox/${encodeURIComponent(this.agentId)}/git/commits/${encodeURIComponent(commitId)}`
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  async gitRestore(commitId: string): Promise<{ ok: boolean; restoredTo: string }> {
+    return this.request<{ ok: boolean; restoredTo: string }>(
+      "POST",
+      `/mailbox/${encodeURIComponent(this.agentId)}/git/restore/${encodeURIComponent(commitId)}`
+    );
+  }
+
+  async gitDiff(
+    fromId: string,
+    toId?: string
+  ): Promise<CommitDiff> {
+    let path = `/mailbox/${encodeURIComponent(this.agentId)}/git/diff?from=${encodeURIComponent(fromId)}`;
+    if (toId) path += `&to=${encodeURIComponent(toId)}`;
+    return this.request<CommitDiff>("GET", path);
+  }
+
+  async gitMerge(
+    fromBranch: string,
+    toBranch: string,
+    opts?: { strategy?: "union" | "ours" | "theirs" }
+  ): Promise<AgentCommit> {
+    return this.request<AgentCommit>(
+      "POST",
+      `/mailbox/${encodeURIComponent(this.agentId)}/git/merge`,
+      { fromBranch, toBranch, strategy: opts?.strategy ?? "union" }
+    );
+  }
+
+  // ---------- Annotations (client-side) ----------
+
+  /**
+   * Analyze a source file using this agent's graph + index, then return the
+   * file with @context JSDoc annotations inserted/updated. Pure client-side —
+   * no new server routes hit beyond the existing getIndex / queryGraph.
+   */
+  async annotateFile(filePath: string, source: string): Promise<string> {
+    const { Annotator } = await import("./annotator");
+    return new Annotator(this).annotateFile(filePath, source);
+  }
+
+  /** Annotate + stamp every block's @changed with the supplied edit summary. */
+  async postEditAnnotate(
+    filePath: string,
+    source: string,
+    editSummary: string
+  ): Promise<string> {
+    const { Annotator } = await import("./annotator");
+    return new Annotator(this).postEditAnnotate(filePath, source, editSummary);
+  }
 }
 
 export * from "./types";
 export { assembleContext } from "./context";
 export type {
+  AgentCommit,
+  CommitDiff,
+  CommitSnapshot,
   GraphNode,
   GraphEdge,
   GraphNodeType,
   CodebaseIndexEntry,
   IndexCategory,
+  StalenessResult,
 } from "./storage/interface";
+export type {
+  CodeAnnotation,
+  FileAnnotation,
+  AnnotateOptions,
+  AnnotatableBlock,
+} from "./annotations";
+export { Annotator } from "./annotator";

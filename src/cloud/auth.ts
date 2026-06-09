@@ -27,7 +27,8 @@ export interface GeneratedKey {
 }
 
 const KEY_BYTES = 32;
-const KEY_PREFIX = "sk_live_";
+export const KEY_PREFIX = "sk_live_";
+export const UPGRADE_URL = "https://agentsmcp.com/pricing";
 const PREFIX_DISPLAY_LEN = 16;
 
 /**

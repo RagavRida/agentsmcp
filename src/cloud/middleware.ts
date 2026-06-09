@@ -1,5 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import {
+  KEY_PREFIX,
+  UPGRADE_URL,
   PgPoolLike,
   verifyApiKey,
   getPlanLimits,
@@ -74,7 +76,7 @@ export function cloudAuth(opts: CloudAuthOptions) {
     try {
       let verified: { userId: string; plan: string; keyId: string } | null = null;
 
-      if (token.startsWith("sk_live_")) {
+      if (token.startsWith(KEY_PREFIX)) {
         verified = await verifyApiKey(pool, token);
       } else if (sessionSecret) {
         const payload = verifySession(token, sessionSecret);
@@ -137,7 +139,7 @@ function limitFailure(
       resource,
       current,
       limit,
-      upgrade: "https://agentsmcp.com/pricing",
+      upgrade: UPGRADE_URL,
     },
   };
 }

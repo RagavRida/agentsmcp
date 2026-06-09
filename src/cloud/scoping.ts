@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import {
   Agent,
@@ -9,9 +10,15 @@ import {
   ThreadSummary,
 } from "../types";
 import {
+  AgentCommit,
   CodebaseIndexEntry,
+  CommitDiff,
+  CommitSnapshot,
   GraphEdge,
   GraphNode,
+  MAX_COMMIT_INDEX_ENTRIES,
+  MAX_COMMIT_NODES,
+  StalenessResult,
   Storage,
 } from "../storage/interface";
 
@@ -159,49 +166,68 @@ export class ScopedStorage implements Storage {
     const silentSet = new Set(this.uniqueSorted(silentParticipants));
     for (const v of visible) silentSet.delete(v);
     const silent = Array.from(silentSet).sort();
+    const participantsHash = visible.join(",");
 
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       const tRes = await client.query<ThreadRow>(
-        `INSERT INTO threads (id, user_id) VALUES ($1, $2)
+        `INSERT INTO threads (id, user_id, participants_hash)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (participants_hash, user_id) DO NOTHING
          RETURNING id, created_at, updated_at`,
-        [id, this.userId]
+        [id, this.userId, participantsHash]
       );
-      for (const a of visible) {
-        await client.query(
-          `INSERT INTO agents (id, user_id) VALUES ($1, $2)
-           ON CONFLICT (id) DO NOTHING`,
-          [a, this.userId]
+
+      let actualId: string;
+      let created_at: Date;
+      let updated_at: Date;
+
+      if (tRes.rows.length === 0) {
+        const existing = await client.query<ThreadRow>(
+          `SELECT id, created_at, updated_at FROM threads
+           WHERE participants_hash = $1 AND user_id = $2`,
+          [participantsHash, this.userId]
         );
-        await client.query(
-          `INSERT INTO thread_participants (thread_id, agent_id, role)
-           VALUES ($1, $2, 'visible')
-           ON CONFLICT (thread_id, agent_id) DO NOTHING`,
-          [id, a]
-        );
-      }
-      for (const a of silent) {
-        await client.query(
-          `INSERT INTO agents (id, user_id) VALUES ($1, $2)
-           ON CONFLICT (id) DO NOTHING`,
-          [a, this.userId]
-        );
-        await client.query(
-          `INSERT INTO thread_participants (thread_id, agent_id, role)
-           VALUES ($1, $2, 'silent')
-           ON CONFLICT (thread_id, agent_id) DO NOTHING`,
-          [id, a]
-        );
+        if (existing.rows.length === 0) throw new Error("thread creation race: no winner");
+        actualId = existing.rows[0].id;
+        created_at = existing.rows[0].created_at;
+        updated_at = existing.rows[0].updated_at;
+      } else {
+        actualId = tRes.rows[0].id;
+        created_at = tRes.rows[0].created_at;
+        updated_at = tRes.rows[0].updated_at;
+        for (const a of visible) {
+          await client.query(
+            `INSERT INTO agents (id, user_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+            [a, this.userId]
+          );
+          await client.query(
+            `INSERT INTO thread_participants (thread_id, agent_id, role)
+             VALUES ($1, $2, 'visible') ON CONFLICT (thread_id, agent_id) DO NOTHING`,
+            [actualId, a]
+          );
+        }
+        for (const a of silent) {
+          await client.query(
+            `INSERT INTO agents (id, user_id) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+            [a, this.userId]
+          );
+          await client.query(
+            `INSERT INTO thread_participants (thread_id, agent_id, role)
+             VALUES ($1, $2, 'silent') ON CONFLICT (thread_id, agent_id) DO NOTHING`,
+            [actualId, a]
+          );
+        }
       }
       await client.query("COMMIT");
       return {
-        id: tRes.rows[0].id,
+        id: actualId,
         participants: visible,
         silentParticipants: silent,
         messages: [],
-        createdAt: toMs(tRes.rows[0].created_at),
-        updatedAt: toMs(tRes.rows[0].updated_at),
+        createdAt: toMs(created_at),
+        updatedAt: toMs(updated_at),
       };
     } catch (e) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -443,28 +469,35 @@ export class ScopedStorage implements Storage {
 
   // ---------- Mailbox ----------
 
-  async getMailbox(agentId: AgentAddress): Promise<Mailbox> {
-    // Agent IDs are a global address book — `agents.id` is unique across all
-    // tenants. Tenant isolation lives on `threads.user_id` instead: a user
-    // can ask for any agentId's mailbox; they just won't see threads owned
-    // by other users. Same email-style mental model: `alice@gmail.com` is
-    // a global address but each inbox containing mail to her is separate.
-    const res = await this.pool.query<{
-      thread_id: string;
-      unread_count: number;
-    }>(
-      `SELECT ms.thread_id, ms.unread_count
-       FROM mailbox_state ms
-       JOIN threads t ON t.id = ms.thread_id
-       WHERE ms.agent_id = $1 AND t.user_id = $2`,
-      [agentId, this.userId]
-    );
-    const threads = res.rows.map((r) => r.thread_id);
-    const unreadCount = res.rows.reduce(
-      (acc, r) => acc + Number(r.unread_count),
-      0
-    );
-    return { agentId, threads, unreadCount };
+  async getMailbox(
+    agentId: AgentAddress,
+    opts?: { limit?: number; offset?: number }
+  ): Promise<Mailbox & { total: number }> {
+    // Agent IDs are a global address book — tenant isolation is via threads.user_id.
+    const limit = Math.min(opts?.limit ?? 100, 1000);
+    const offset = Math.max(opts?.offset ?? 0, 0);
+
+    const [pageRes, totalRes] = await Promise.all([
+      this.pool.query<{ thread_id: string; unread_count: number }>(
+        `SELECT ms.thread_id, ms.unread_count
+         FROM mailbox_state ms
+         JOIN threads t ON t.id = ms.thread_id
+         WHERE ms.agent_id = $1 AND t.user_id = $2
+         ORDER BY ms.thread_id
+         LIMIT $3 OFFSET $4`,
+        [agentId, this.userId, limit, offset]
+      ),
+      this.pool.query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c
+         FROM mailbox_state ms
+         JOIN threads t ON t.id = ms.thread_id
+         WHERE ms.agent_id = $1 AND t.user_id = $2`,
+        [agentId, this.userId]
+      ),
+    ]);
+    const threads = pageRes.rows.map((r) => r.thread_id);
+    const unreadCount = pageRes.rows.reduce((acc, r) => acc + Number(r.unread_count), 0);
+    return { agentId, threads, unreadCount, total: Number(totalRes.rows[0]?.c ?? 0) };
   }
 
   async markRead(agentId: AgentAddress, threadId: string): Promise<void> {
@@ -555,9 +588,16 @@ export class ScopedStorage implements Storage {
   }
 
   async deleteNode(agentId: AgentAddress, nodeId: string): Promise<void> {
+    // Only delete edges where the node exists AND is owned by this agent.
+    // Without the EXISTS guard, deleting nodeId could touch edges belonging
+    // to a different agent that happens to have a node with the same id.
     await this.pool.query(
-      "DELETE FROM graph_edges WHERE source_id = $1 OR target_id = $1",
-      [nodeId]
+      `DELETE FROM graph_edges
+       WHERE (source_id = $1 OR target_id = $1)
+         AND EXISTS (
+           SELECT 1 FROM graph_nodes WHERE id = $1 AND agent_id = $2
+         )`,
+      [nodeId, agentId]
     );
     await this.pool.query(
       "DELETE FROM graph_nodes WHERE id = $1 AND agent_id = $2",
@@ -588,9 +628,12 @@ export class ScopedStorage implements Storage {
 
   async queryGraph(
     agentId: AgentAddress,
-    query: string
+    query: string,
+    opts?: { limit?: number; depth?: number }
   ): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
     const pattern = `%${query}%`;
+    const maxDepth = Math.min(Math.max(1, opts?.depth ?? 2), 5);
+    const nodeLimit = Math.min(Math.max(1, opts?.limit ?? 30), 200);
 
     const seedRes = await this.pool.query<{ id: string }>(
       `SELECT id FROM graph_nodes
@@ -612,10 +655,11 @@ export class ScopedStorage implements Storage {
          END, h.depth + 1
          FROM hops h
          JOIN graph_edges e ON (e.source_id = h.node_id OR e.target_id = h.node_id)
-         WHERE h.depth < 2
+         WHERE h.depth < $3
        )
-       SELECT DISTINCT node_id FROM hops`,
-      [seedIds, agentId]
+       SELECT DISTINCT node_id FROM hops
+       LIMIT $4`,
+      [seedIds, agentId, maxDepth, nodeLimit]
     );
 
     const allIds = traversalRes.rows.map((r) => r.node_id);
@@ -665,15 +709,50 @@ export class ScopedStorage implements Storage {
     entry: Omit<CodebaseIndexEntry, "updatedAt">
   ): Promise<void> {
     await this.pool.query(
-      `INSERT INTO codebase_index (key, agent_id, category, summary, metadata, updated_at)
-       VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+      `INSERT INTO codebase_index
+         (key, agent_id, category, summary, metadata,
+          parent_key, content_hash, indexed_by, stale, updated_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, FALSE, NOW())
        ON CONFLICT (key, agent_id) DO UPDATE SET
-         category = EXCLUDED.category,
-         summary = EXCLUDED.summary,
-         metadata = EXCLUDED.metadata,
-         updated_at = NOW()`,
-      [entry.key, agentId, entry.category, entry.summary, JSON.stringify(entry.metadata ?? {})]
+         category     = EXCLUDED.category,
+         summary      = EXCLUDED.summary,
+         metadata     = EXCLUDED.metadata,
+         parent_key   = EXCLUDED.parent_key,
+         content_hash = EXCLUDED.content_hash,
+         indexed_by   = EXCLUDED.indexed_by,
+         stale        = FALSE,
+         updated_at   = NOW()`,
+      [
+        entry.key, agentId, entry.category, entry.summary,
+        JSON.stringify(entry.metadata ?? {}),
+        entry.parentKey ?? null,
+        entry.contentHash ?? null,
+        entry.indexedBy ?? null,
+      ]
     );
+  }
+
+  private rowToIndexEntry(r: {
+    key: string; category: string; summary: string;
+    metadata: Record<string, unknown>;
+    parent_key?: string | null;
+    content_hash?: string | null;
+    indexed_by?: string | null;
+    stale?: boolean;
+    updated_at: Date;
+  }): CodebaseIndexEntry {
+    const entry: CodebaseIndexEntry = {
+      key: r.key,
+      category: r.category as CodebaseIndexEntry["category"],
+      summary: r.summary,
+      metadata: r.metadata,
+      updatedAt: toMs(r.updated_at),
+    };
+    if (r.parent_key) entry.parentKey = r.parent_key;
+    if (r.content_hash) entry.contentHash = r.content_hash;
+    if (r.indexed_by) entry.indexedBy = r.indexed_by;
+    if (r.stale) entry.stale = r.stale;
+    return entry;
   }
 
   async getIndex(
@@ -682,51 +761,53 @@ export class ScopedStorage implements Storage {
   ): Promise<CodebaseIndexEntry | null> {
     const res = await this.pool.query<{
       key: string; category: string; summary: string;
-      metadata: Record<string, unknown>; updated_at: Date;
+      metadata: Record<string, unknown>;
+      parent_key: string | null;
+      content_hash: string | null;
+      indexed_by: string | null;
+      stale: boolean;
+      updated_at: Date;
     }>(
-      `SELECT key, category, summary, metadata, updated_at
+      `SELECT key, category, summary, metadata,
+              parent_key, content_hash, indexed_by, stale, updated_at
        FROM codebase_index WHERE key = $1 AND agent_id = $2`,
       [key, agentId]
     );
     if (res.rows.length === 0) return null;
-    const r = res.rows[0];
-    return {
-      key: r.key,
-      category: r.category as CodebaseIndexEntry["category"],
-      summary: r.summary,
-      metadata: r.metadata,
-      updatedAt: toMs(r.updated_at),
-    };
+    return this.rowToIndexEntry(res.rows[0]);
   }
 
   async searchIndex(
     agentId: AgentAddress,
     query: string,
-    category?: string
+    category?: string,
+    opts?: { limit?: number }
   ): Promise<CodebaseIndexEntry[]> {
+    const resultLimit = Math.min(Math.max(1, opts?.limit ?? 50), 200);
     const pattern = `%${query}%`;
     const params: unknown[] = [agentId, pattern];
-    let sql = `SELECT key, category, summary, metadata, updated_at
+    let sql = `SELECT key, category, summary, metadata,
+                      parent_key, content_hash, indexed_by, stale, updated_at
                FROM codebase_index
                WHERE agent_id = $1 AND (key ILIKE $2 OR summary ILIKE $2)`;
     if (category) {
       params.push(category);
       sql += ` AND category = $${params.length}`;
     }
-    sql += " ORDER BY updated_at DESC LIMIT 50";
+    params.push(resultLimit);
+    sql += ` ORDER BY updated_at DESC LIMIT $${params.length}`;
 
     const res = await this.pool.query<{
       key: string; category: string; summary: string;
-      metadata: Record<string, unknown>; updated_at: Date;
+      metadata: Record<string, unknown>;
+      parent_key: string | null;
+      content_hash: string | null;
+      indexed_by: string | null;
+      stale: boolean;
+      updated_at: Date;
     }>(sql, params);
 
-    return res.rows.map((r) => ({
-      key: r.key,
-      category: r.category as CodebaseIndexEntry["category"],
-      summary: r.summary,
-      metadata: r.metadata,
-      updatedAt: toMs(r.updated_at),
-    }));
+    return res.rows.map((r) => this.rowToIndexEntry(r));
   }
 
   async deleteIndex(agentId: AgentAddress, key: string): Promise<void> {
@@ -735,4 +816,517 @@ export class ScopedStorage implements Storage {
       [key, agentId]
     );
   }
+
+  async checkStaleness(
+    agentId: AgentAddress,
+    entries: Array<{ key: string; currentHash: string }>
+  ): Promise<StalenessResult> {
+    if (entries.length === 0) return { fresh: [], stale: [], missing: [] };
+    const keys = entries.map((e) => e.key);
+    const hashMap = new Map(entries.map((e) => [e.key, e.currentHash]));
+
+    const res = await this.pool.query<{ key: string; content_hash: string | null }>(
+      `SELECT key, content_hash FROM codebase_index
+       WHERE agent_id = $1 AND key = ANY($2::text[])`,
+      [agentId, keys]
+    );
+
+    const found = new Map(res.rows.map((r) => [r.key, r.content_hash]));
+    const fresh: string[] = [];
+    const stale: string[] = [];
+    const missing: string[] = [];
+    const staleKeys: string[] = [];
+
+    for (const { key, currentHash } of entries) {
+      if (!found.has(key)) {
+        missing.push(key);
+      } else if (found.get(key) === currentHash) {
+        fresh.push(key);
+      } else {
+        stale.push(key);
+        staleKeys.push(key);
+      }
+    }
+
+    if (staleKeys.length > 0) {
+      await this.pool.query(
+        `UPDATE codebase_index SET stale = TRUE
+         WHERE agent_id = $1 AND key = ANY($2::text[])`,
+        [agentId, staleKeys]
+      );
+    }
+
+    return { fresh, stale, missing };
+  }
+
+  async rollupModule(
+    agentId: AgentAddress,
+    moduleKey: string,
+    fileKeys: string[]
+  ): Promise<void> {
+    if (fileKeys.length === 0) return;
+    const res = await this.pool.query<{ key: string; summary: string }>(
+      `SELECT key, summary FROM codebase_index
+       WHERE agent_id = $1 AND key = ANY($2::text[])`,
+      [agentId, fileKeys]
+    );
+    const summaryMap = new Map(res.rows.map((r) => [r.key, r.summary]));
+    const combined = fileKeys
+      .filter((k) => summaryMap.has(k))
+      .map((k) => `[${k}] ${summaryMap.get(k)!}`)
+      .join("\n");
+
+    await this.pool.query(
+      `INSERT INTO codebase_index
+         (key, agent_id, category, summary, metadata,
+          parent_key, content_hash, indexed_by, stale, updated_at)
+       VALUES ($1, $2, 'module', $3, '{}'::jsonb, NULL, NULL, NULL, FALSE, NOW())
+       ON CONFLICT (key, agent_id) DO UPDATE SET
+         summary    = EXCLUDED.summary,
+         stale      = FALSE,
+         updated_at = NOW()`,
+      [moduleKey, agentId, combined]
+    );
+
+    await this.pool.query(
+      `UPDATE codebase_index SET parent_key = $1, updated_at = NOW()
+       WHERE agent_id = $2 AND key = ANY($3::text[])`,
+      [moduleKey, agentId, fileKeys]
+    );
+  }
+
+  // ---------- Git / Version Control ----------
+  // Scoped git: all commits are filtered by both agent_id AND this.userId
+  // via the threads.user_id fence. Agent IDs are a global address book, so
+  // commits are scoped by ownership of the underlying graph data (same as
+  // how threads work — the agent_id is a global key but data is per-user).
+
+  private async captureSnapshotScoped(agentId: AgentAddress): Promise<CommitSnapshot> {
+    const nodeRes = await this.pool.query<{
+      id: string; type: string; name: string;
+      description: string | null; metadata: Record<string, unknown>;
+    }>(
+      `SELECT id, type, name, description, metadata FROM graph_nodes WHERE agent_id = $1`,
+      [agentId]
+    );
+    const nodeIds = nodeRes.rows.map((r) => r.id);
+    let edgeRows: Array<{ source_id: string; target_id: string; type: string; weight: number }> = [];
+    if (nodeIds.length > 0) {
+      const edgeRes = await this.pool.query<{
+        source_id: string; target_id: string; type: string; weight: number;
+      }>(
+        `SELECT source_id, target_id, type, weight FROM graph_edges
+         WHERE source_id = ANY($1::text[]) AND target_id = ANY($1::text[])`,
+        [nodeIds]
+      );
+      edgeRows = edgeRes.rows;
+    }
+    const indexRes = await this.pool.query<{
+      key: string; category: string; summary: string;
+      metadata: Record<string, unknown>; parent_key: string | null; content_hash: string | null;
+    }>(
+      `SELECT key, category, summary, metadata, parent_key, content_hash
+       FROM codebase_index WHERE agent_id = $1`,
+      [agentId]
+    );
+    return {
+      nodes: nodeRes.rows.map((r) => ({
+        id: r.id,
+        type: r.type as GraphNode["type"],
+        name: r.name,
+        description: r.description ?? undefined,
+        metadata: r.metadata,
+      })),
+      edges: edgeRows.map((r) => ({
+        sourceId: r.source_id, targetId: r.target_id, type: r.type, weight: r.weight,
+      })),
+      indexEntries: indexRes.rows.map((r) => {
+        const entry: CommitSnapshot["indexEntries"][0] = {
+          key: r.key,
+          category: r.category as CodebaseIndexEntry["category"],
+          summary: r.summary,
+          metadata: r.metadata,
+        };
+        if (r.parent_key) entry.parentKey = r.parent_key;
+        if (r.content_hash) entry.contentHash = r.content_hash;
+        return entry;
+      }),
+    };
+  }
+
+  async createCommit(
+    agentId: AgentAddress,
+    message: string,
+    opts?: { branch?: string; keepLast?: number }
+  ): Promise<AgentCommit> {
+    const id = uuidv4();
+    const branch = opts?.branch ?? "main";
+    const snapshot = await this.captureSnapshotScoped(agentId);
+
+    if (snapshot.nodes.length > MAX_COMMIT_NODES) {
+      throw Object.assign(
+        new Error(`snapshot too large: ${snapshot.nodes.length} nodes exceeds limit of ${MAX_COMMIT_NODES}`),
+        { status: 413 }
+      );
+    }
+    if (snapshot.indexEntries.length > MAX_COMMIT_INDEX_ENTRIES) {
+      throw Object.assign(
+        new Error(`snapshot too large: ${snapshot.indexEntries.length} index entries exceeds limit of ${MAX_COMMIT_INDEX_ENTRIES}`),
+        { status: 413 }
+      );
+    }
+    const hashInput = JSON.stringify({
+      nodes: snapshot.nodes.map((n) => n.id).sort(),
+      index: snapshot.indexEntries.map((e) => e.key).sort(),
+    });
+    const snapshotHash = createHash("sha256").update(hashInput).digest("hex").slice(0, 16);
+
+    const parentRes = await this.pool.query<{ id: string }>(
+      `SELECT id FROM agent_commits WHERE agent_id = $1 AND branch = $2
+       ORDER BY created_at DESC LIMIT 1`,
+      [agentId, branch]
+    );
+    const parentId = parentRes.rows[0]?.id ?? null;
+
+    const res = await this.pool.query<{ id: string; created_at: Date }>(
+      `INSERT INTO agent_commits
+         (id, agent_id, parent_id, branch, message, snapshot, snapshot_hash,
+          node_count, index_count)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+       RETURNING id, created_at`,
+      [
+        id, agentId, parentId, branch, message,
+        JSON.stringify(snapshot), snapshotHash,
+        snapshot.nodes.length, snapshot.indexEntries.length,
+      ]
+    );
+
+    if (opts?.keepLast && opts.keepLast > 0) {
+      const cutoff = await this.pool.query<{ created_at: Date }>(
+        `SELECT created_at FROM agent_commits
+         WHERE agent_id = $1 AND branch = $2
+         ORDER BY created_at DESC
+         LIMIT 1 OFFSET $3`,
+        [agentId, branch, opts.keepLast - 1]
+      );
+      if (cutoff.rows.length > 0) {
+        await this.pool.query(
+          `DELETE FROM agent_commits
+           WHERE agent_id = $1 AND branch = $2 AND created_at < $3`,
+          [agentId, branch, cutoff.rows[0].created_at]
+        );
+      }
+    }
+
+    return {
+      id, agentId, parentId, branch, message, snapshotHash,
+      nodeCount: snapshot.nodes.length,
+      indexCount: snapshot.indexEntries.length,
+      createdAt: toMs(res.rows[0].created_at),
+    };
+  }
+
+  async deleteCommit(agentId: AgentAddress, commitId: string): Promise<boolean> {
+    const res = await this.pool.query(
+      "DELETE FROM agent_commits WHERE id = $1 AND agent_id = $2",
+      [commitId, agentId]
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  async listCommits(
+    agentId: AgentAddress,
+    opts?: { branch?: string; limit?: number }
+  ): Promise<AgentCommit[]> {
+    const limit = Math.min(opts?.limit ?? 20, 100);
+    const params: unknown[] = [agentId];
+    let sql = `SELECT id, agent_id, parent_id, branch, message, snapshot_hash,
+                      node_count, index_count, created_at
+               FROM agent_commits WHERE agent_id = $1`;
+    if (opts?.branch) {
+      params.push(opts.branch);
+      sql += ` AND branch = $${params.length}`;
+    }
+    params.push(limit);
+    sql += ` ORDER BY created_at DESC LIMIT $${params.length}`;
+
+    const res = await this.pool.query<{
+      id: string; agent_id: string; parent_id: string | null; branch: string;
+      message: string; snapshot_hash: string; node_count: number;
+      index_count: number; created_at: Date;
+    }>(sql, params);
+
+    return res.rows.map((r) => ({
+      id: r.id, agentId: r.agent_id, parentId: r.parent_id, branch: r.branch,
+      message: r.message, snapshotHash: r.snapshot_hash,
+      nodeCount: r.node_count, indexCount: r.index_count,
+      createdAt: toMs(r.created_at),
+    }));
+  }
+
+  async getCommit(
+    agentId: AgentAddress,
+    commitId: string
+  ): Promise<(AgentCommit & { snapshot: CommitSnapshot }) | null> {
+    const res = await this.pool.query<{
+      id: string; agent_id: string; parent_id: string | null; branch: string;
+      message: string; snapshot: CommitSnapshot; snapshot_hash: string;
+      node_count: number; index_count: number; created_at: Date;
+    }>(
+      `SELECT id, agent_id, parent_id, branch, message, snapshot, snapshot_hash,
+              node_count, index_count, created_at
+       FROM agent_commits WHERE id = $1 AND agent_id = $2`,
+      [commitId, agentId]
+    );
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      id: r.id, agentId: r.agent_id, parentId: r.parent_id, branch: r.branch,
+      message: r.message, snapshotHash: r.snapshot_hash,
+      nodeCount: r.node_count, indexCount: r.index_count,
+      createdAt: toMs(r.created_at),
+      snapshot: r.snapshot,
+    };
+  }
+
+  async restoreCommit(agentId: AgentAddress, commitId: string): Promise<void> {
+    const res = await this.pool.query<{ snapshot: CommitSnapshot }>(
+      `SELECT snapshot FROM agent_commits WHERE id = $1 AND agent_id = $2`,
+      [commitId, agentId]
+    );
+    if (res.rows.length === 0) throw new Error(`commit ${commitId} not found`);
+    const snapshot = res.rows[0].snapshot;
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const nodeIdsRes = await client.query<{ id: string }>(
+        `SELECT id FROM graph_nodes WHERE agent_id = $1`,
+        [agentId]
+      );
+      const existingIds = nodeIdsRes.rows.map((r) => r.id);
+      if (existingIds.length > 0) {
+        await client.query(
+          `DELETE FROM graph_edges
+           WHERE source_id = ANY($1::text[]) OR target_id = ANY($1::text[])`,
+          [existingIds]
+        );
+      }
+      await client.query(`DELETE FROM graph_nodes WHERE agent_id = $1`, [agentId]);
+      await client.query(`DELETE FROM codebase_index WHERE agent_id = $1`, [agentId]);
+
+      for (const n of snapshot.nodes) {
+        await client.query(
+          `INSERT INTO graph_nodes (id, agent_id, type, name, description, metadata, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
+           ON CONFLICT (id, agent_id) DO UPDATE SET
+             type = EXCLUDED.type, name = EXCLUDED.name,
+             description = EXCLUDED.description, metadata = EXCLUDED.metadata,
+             updated_at = NOW()`,
+          [n.id, agentId, n.type, n.name, n.description ?? null,
+            JSON.stringify(n.metadata ?? {})]
+        );
+      }
+      for (const e of snapshot.edges) {
+        await client.query(
+          `INSERT INTO graph_edges (source_id, target_id, type, weight)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (source_id, target_id, type) DO UPDATE SET weight = EXCLUDED.weight`,
+          [e.sourceId, e.targetId, e.type, e.weight ?? 1.0]
+        );
+      }
+      for (const entry of snapshot.indexEntries) {
+        await client.query(
+          `INSERT INTO codebase_index
+             (key, agent_id, category, summary, metadata,
+              parent_key, content_hash, indexed_by, stale, updated_at)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, NULL, FALSE, NOW())
+           ON CONFLICT (key, agent_id) DO UPDATE SET
+             category = EXCLUDED.category, summary = EXCLUDED.summary,
+             metadata = EXCLUDED.metadata, parent_key = EXCLUDED.parent_key,
+             content_hash = EXCLUDED.content_hash, stale = FALSE, updated_at = NOW()`,
+          [
+            entry.key, agentId, entry.category, entry.summary,
+            JSON.stringify(entry.metadata ?? {}),
+            entry.parentKey ?? null, entry.contentHash ?? null,
+          ]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  async diffCommits(
+    agentId: AgentAddress,
+    fromId: string,
+    toId: string | null
+  ): Promise<CommitDiff> {
+    const fromRes = await this.pool.query<{ snapshot: CommitSnapshot }>(
+      `SELECT snapshot FROM agent_commits WHERE id = $1 AND agent_id = $2`,
+      [fromId, agentId]
+    );
+    if (fromRes.rows.length === 0) throw new Error(`commit ${fromId} not found`);
+    const fromSnap = fromRes.rows[0].snapshot;
+
+    let toSnap: CommitSnapshot;
+    if (toId) {
+      const toRes = await this.pool.query<{ snapshot: CommitSnapshot }>(
+        `SELECT snapshot FROM agent_commits WHERE id = $1 AND agent_id = $2`,
+        [toId, agentId]
+      );
+      if (toRes.rows.length === 0) throw new Error(`commit ${toId} not found`);
+      toSnap = toRes.rows[0].snapshot;
+    } else {
+      toSnap = await this.captureSnapshotScoped(agentId);
+    }
+
+    return scopedComputeCommitDiff(fromSnap, toSnap);
+  }
+
+  async mergeCommits(
+    agentId: AgentAddress,
+    fromBranch: string,
+    toBranch: string,
+    opts?: { strategy?: "union" | "ours" | "theirs"; message?: string }
+  ): Promise<AgentCommit> {
+    const strategy = opts?.strategy ?? "union";
+    const [fromRes, toRes] = await Promise.all([
+      this.pool.query<{ snapshot: CommitSnapshot }>(
+        `SELECT snapshot FROM agent_commits WHERE agent_id = $1 AND branch = $2
+         ORDER BY created_at DESC LIMIT 1`,
+        [agentId, fromBranch]
+      ),
+      this.pool.query<{ snapshot: CommitSnapshot }>(
+        `SELECT snapshot FROM agent_commits WHERE agent_id = $1 AND branch = $2
+         ORDER BY created_at DESC LIMIT 1`,
+        [agentId, toBranch]
+      ),
+    ]);
+    if (fromRes.rows.length === 0) throw new Error(`branch '${fromBranch}' has no commits`);
+    if (toRes.rows.length === 0) throw new Error(`branch '${toBranch}' has no commits`);
+
+    const merged = scopedMergeSnapshots(toRes.rows[0].snapshot, fromRes.rows[0].snapshot, strategy);
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const nodeIdsRes = await client.query<{ id: string }>(`SELECT id FROM graph_nodes WHERE agent_id = $1`, [agentId]);
+      const existingIds = nodeIdsRes.rows.map((r) => r.id);
+      if (existingIds.length > 0) {
+        await client.query(`DELETE FROM graph_edges WHERE source_id = ANY($1::text[]) OR target_id = ANY($1::text[])`, [existingIds]);
+      }
+      await client.query(`DELETE FROM graph_nodes WHERE agent_id = $1`, [agentId]);
+      await client.query(`DELETE FROM codebase_index WHERE agent_id = $1`, [agentId]);
+      for (const n of merged.nodes) {
+        await client.query(
+          `INSERT INTO graph_nodes (id, agent_id, type, name, description, metadata, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
+           ON CONFLICT (id, agent_id) DO UPDATE SET type=EXCLUDED.type, name=EXCLUDED.name, description=EXCLUDED.description, metadata=EXCLUDED.metadata, updated_at=NOW()`,
+          [n.id, agentId, n.type, n.name, n.description ?? null, JSON.stringify(n.metadata ?? {})]
+        );
+      }
+      for (const e of merged.edges) {
+        await client.query(
+          `INSERT INTO graph_edges (source_id, target_id, type, weight) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (source_id, target_id, type) DO UPDATE SET weight=EXCLUDED.weight`,
+          [e.sourceId, e.targetId, e.type, e.weight ?? 1.0]
+        );
+      }
+      for (const entry of merged.indexEntries) {
+        await client.query(
+          `INSERT INTO codebase_index (key, agent_id, category, summary, metadata, parent_key, content_hash, indexed_by, stale, updated_at)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, NULL, FALSE, NOW())
+           ON CONFLICT (key, agent_id) DO UPDATE SET category=EXCLUDED.category, summary=EXCLUDED.summary, metadata=EXCLUDED.metadata, parent_key=EXCLUDED.parent_key, content_hash=EXCLUDED.content_hash, stale=FALSE, updated_at=NOW()`,
+          [entry.key, agentId, entry.category, entry.summary, JSON.stringify(entry.metadata ?? {}), entry.parentKey ?? null, entry.contentHash ?? null]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    const mergeMsg = opts?.message ?? `Merge '${fromBranch}' into '${toBranch}' (${strategy})`;
+    return this.createCommit(agentId, mergeMsg, { branch: toBranch });
+  }
+}
+
+function scopedMergeSnapshots(
+  ours: CommitSnapshot,
+  theirs: CommitSnapshot,
+  strategy: "union" | "ours" | "theirs"
+): CommitSnapshot {
+  if (strategy === "ours") return ours;
+  if (strategy === "theirs") return theirs;
+
+  const nodeMap = new Map<string, CommitSnapshot["nodes"][0]>();
+  for (const n of ours.nodes) nodeMap.set(n.id, n);
+  for (const n of theirs.nodes) {
+    if (!nodeMap.has(n.id)) {
+      nodeMap.set(n.id, n);
+    } else {
+      const cur = nodeMap.get(n.id)!;
+      if (JSON.stringify(n) > JSON.stringify(cur)) nodeMap.set(n.id, n);
+    }
+  }
+
+  const edgeKey = (e: GraphEdge) => `${e.sourceId}|${e.targetId}|${e.type}`;
+  const edgeMap = new Map<string, GraphEdge>();
+  for (const e of [...ours.edges, ...theirs.edges]) edgeMap.set(edgeKey(e), e);
+  const validNodeIds = new Set(nodeMap.keys());
+  const edges = [...edgeMap.values()].filter(
+    (e) => validNodeIds.has(e.sourceId) && validNodeIds.has(e.targetId)
+  );
+
+  const indexMap = new Map<string, CommitSnapshot["indexEntries"][0]>();
+  for (const e of ours.indexEntries) indexMap.set(e.key, e);
+  for (const e of theirs.indexEntries) {
+    if (!indexMap.has(e.key)) {
+      indexMap.set(e.key, e);
+    } else {
+      const cur = indexMap.get(e.key)!;
+      if (JSON.stringify(e) > JSON.stringify(cur)) indexMap.set(e.key, e);
+    }
+  }
+
+  return { nodes: [...nodeMap.values()], edges, indexEntries: [...indexMap.values()] };
+}
+
+function scopedComputeCommitDiff(from: CommitSnapshot, to: CommitSnapshot): CommitDiff {
+  const fromNodes = new Map(from.nodes.map((n) => [n.id, n]));
+  const toNodes = new Map(to.nodes.map((n) => [n.id, n]));
+  const fromIndex = new Map(from.indexEntries.map((e) => [e.key, e]));
+  const toIndex = new Map(to.indexEntries.map((e) => [e.key, e]));
+
+  const nodesAdded = [...toNodes.keys()].filter((k) => !fromNodes.has(k));
+  const nodesRemoved = [...fromNodes.keys()].filter((k) => !toNodes.has(k));
+  const nodesModified = [...fromNodes.keys()].filter((k) => {
+    const a = fromNodes.get(k)!;
+    const b = toNodes.get(k);
+    if (!b) return false;
+    return (
+      a.name !== b.name ||
+      a.description !== b.description ||
+      JSON.stringify(a.metadata) !== JSON.stringify(b.metadata)
+    );
+  });
+  const indexAdded = [...toIndex.keys()].filter((k) => !fromIndex.has(k));
+  const indexRemoved = [...fromIndex.keys()].filter((k) => !toIndex.has(k));
+  const indexModified = [...fromIndex.keys()].filter((k) => {
+    const a = fromIndex.get(k)!;
+    const b = toIndex.get(k);
+    if (!b) return false;
+    return (
+      a.summary !== b.summary ||
+      JSON.stringify(a.metadata) !== JSON.stringify(b.metadata)
+    );
+  });
+  return { nodesAdded, nodesRemoved, nodesModified, indexAdded, indexRemoved, indexModified };
 }

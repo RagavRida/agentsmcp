@@ -1,0 +1,71 @@
+# Example GitHub Actions workflow for indexing your codebase into AgentMailbox.
+#
+# Copy this to YOUR project's .github/workflows/index.yml (not this repo's).
+# This file is provided as a reference template.
+#
+# How it works:
+#   1. On every push to main, git diff HEAD~1 finds changed files
+#   2. agentsmcp-index --mode incremental re-indexes only those files
+#   3. Updated summaries are pushed to your AgentMailbox server
+#   4. Every agent session reads fresh summaries instead of raw files
+#
+# Required secrets (set in GitHub → Settings → Secrets → Actions):
+#   AGENTSMCP_SERVER:  your server URL, e.g. https://hdnxa5c8yr.us-east-1.awsapprunner.com
+#   AGENTSMCP_API_KEY: your API key (sk_live_xxx)
+
+name: Index Codebase
+
+on:
+  push:
+    branches: [main, master]
+  # Allow manual trigger for full re-index
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Indexing mode'
+        required: true
+        default: 'incremental'
+        type: choice
+        options:
+          - incremental
+          - full
+
+jobs:
+  index:
+    name: Index codebase into AgentMailbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Need at least 2 commits for incremental diff (HEAD~1)
+          fetch-depth: 2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            echo "mode=incremental" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run indexer
+        env:
+          AGENTSMCP_SERVER: ${{ secrets.AGENTSMCP_SERVER }}
+          AGENTSMCP_API_KEY: ${{ secrets.AGENTSMCP_API_KEY }}
+        run: |
+          npx agentsmcp@latest agentsmcp-index \
+            --server "$AGENTSMCP_SERVER" \
+            --api-key "$AGENTSMCP_API_KEY" \
+            --agent-id "project@${{ github.repository }}" \
+            --dir ./src \
+            --mode ${{ steps.mode.outputs.mode }} \
+            --exclude "node_modules,dist,.git,*.test.ts,*.spec.ts,*.d.ts,coverage"
