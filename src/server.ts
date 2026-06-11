@@ -391,8 +391,24 @@ export function createServer(
   app.use(createHttpLogger({ autoLogging: cloudMode }));
 
   app.get("/health", (_req: Request, res: Response) => {
-    res.json({ ok: true });
+    res.json({ ok: true, uptime: process.uptime(), memoryMB: Math.round(process.memoryUsage.rss() / 1048576) });
   });
+
+  // Readiness probe — returns 503 during graceful shutdown draining.
+  // Container orchestrators (App Runner, ECS, k8s) should check /ready;
+  // /health stays 200 for liveness probes.
+  let shutdownInProgress = false;
+  app.get("/ready", (_req: Request, res: Response) => {
+    if (shutdownInProgress) {
+      return res.status(503).json({ ready: false, reason: "shutting down" });
+    }
+    res.json({ ready: true });
+  });
+
+  /** Mark this server instance as draining. Called from shutdown handlers. */
+  function beginDrain(): void {
+    shutdownInProgress = true;
+  }
 
   // Agent Cards (A2A v1.0). Public discovery — no auth, per spec.
   app.get("/.well-known/agent-card.json", (req: Request, res: Response) => {
@@ -1870,7 +1886,7 @@ export function createServer(
     res.status(status).json({ error: message, requestId });
   });
 
-  return { app, storage, ready, rateLimiter };
+  return { app, storage, ready, rateLimiter, beginDrain };
 }
 
 if (require.main === module) {
@@ -1888,12 +1904,51 @@ if (require.main === module) {
   const port = Number(process.env.PORT ?? 3000);
   const dbPath =
     readEnv("AGENTSMCP_DB", "AGENTMAILBOX_DB") ?? "agentmailbox.db";
-  const { app, ready } = createServer(dbPath);
+  const { app, storage, ready, beginDrain } = createServer(dbPath);
   ready
     .then(() => {
-      app.listen(port, () => {
+      const httpServer = app.listen(port, () => {
         logger.info({ port, dbPath }, `server listening on http://localhost:${port}`);
       });
+
+      // ---- Graceful shutdown ----
+      const DRAIN_TIMEOUT_MS = 30_000;
+      let shuttingDown = false;
+
+      async function shutdown(signal: string): Promise<void> {
+        if (shuttingDown) return; // prevent double-shutdown
+        shuttingDown = true;
+        beginDrain(); // /ready starts returning 503
+
+        logger.info({ signal }, "shutdown signal received, draining connections...");
+
+        // Force exit after DRAIN_TIMEOUT_MS if draining hangs
+        const forceTimer = setTimeout(() => {
+          logger.error("drain timeout exceeded, forcing exit");
+          process.exit(1);
+        }, DRAIN_TIMEOUT_MS);
+        forceTimer.unref(); // don't keep event loop alive
+
+        // 1. Stop accepting new connections
+        httpServer.close(() => {
+          logger.info("http server closed, no more connections");
+        });
+
+        // 2. Close database connections
+        try {
+          await storage.close();
+          logger.info("database connections closed");
+        } catch (err) {
+          logger.error({ err }, "error closing database during shutdown");
+        }
+
+        clearTimeout(forceTimer);
+        logger.info("shutdown complete");
+        process.exit(0);
+      }
+
+      process.on("SIGTERM", () => shutdown("SIGTERM"));
+      process.on("SIGINT", () => shutdown("SIGINT"));
     })
     .catch((e) => {
       logger.fatal({ err: e }, "failed to initialize storage");
