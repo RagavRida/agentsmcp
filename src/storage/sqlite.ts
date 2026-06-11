@@ -50,6 +50,7 @@ export class SqliteStorage implements Storage {
   constructor(path = "agentmailbox.db") {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
+    this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
   }
 

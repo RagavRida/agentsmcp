@@ -4,6 +4,8 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { createStorage, Storage } from "./storage";
@@ -380,9 +382,30 @@ export function createServer(
         credentials: true,
       })
     );
+
+    // Security headers — CSP, HSTS, X-Frame-Options, X-Content-Type-Options, etc.
+    // contentSecurityPolicy is relaxed for API-only servers (no HTML served).
+    app.use(
+      helmet({
+        contentSecurityPolicy: false, // API server, no HTML to protect
+        crossOriginEmbedderPolicy: false, // allow cross-origin API calls
+      })
+    );
+
+    // Global IP-based rate limiter — protects auth endpoints from brute-force.
+    // Per-API-key limits are handled separately by src/ratelimit.ts.
+    app.use(
+      rateLimit({
+        windowMs: 60 * 1000, // 1 minute
+        max: 300, // 300 requests per IP per minute
+        standardHeaders: true, // RateLimit-* headers
+        legacyHeaders: false, // disable X-RateLimit-* headers
+        message: { error: "Too many requests, please try again later" },
+      })
+    );
   }
 
-  app.use(express.json({ limit: "10mb" }));
+  app.use(express.json({ limit: "1mb" }));
 
   // Structured request logging (pino-http). `req.log` is always attached so
   // any handler can emit request-correlated logs; automatic per-request
