@@ -348,6 +348,8 @@ export interface CreateServerResult {
   storage: Storage;
   ready: Promise<void>;
   rateLimiter?: RateLimiterHandle;
+  /** Mark server as draining — /ready starts returning 503. */
+  beginDrain: () => void;
 }
 
 export function createServer(

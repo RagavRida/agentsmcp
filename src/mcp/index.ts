@@ -39,11 +39,13 @@ function printUsage(): void {
   process.stderr.write(
     "usage:\n" +
       "  agentsmcp init [options]                 one-command MCP client setup\n" +
+      "  agentsmcp index [options]                CI codebase indexer\n" +
       "  agentsmcp [--agent-id ID] [--server URL] [--api-key KEY]\n" +
       "                                           start the MCP server (stdio)\n" +
       "\n" +
       "env: AGENTSMCP_AGENT_ID, AGENTSMCP_SERVER, AGENTSMCP_API_KEY\n" +
-      "Run `agentsmcp init --help` for setup flags.\n"
+      "Run `agentsmcp init --help` for setup flags.\n" +
+      "Run `agentsmcp-index --help` for indexer flags.\n"
   );
 }
 
@@ -84,6 +86,29 @@ async function main(): Promise<void> {
   if (sub === "init") {
     const initArgs = parseInitArgv(process.argv.slice(3));
     await runInit(initArgs);
+    return;
+  }
+
+  // `agentsmcp agentsmcp-index ...` — delegate to the CI codebase indexer.
+  // The indexer reads its own argv from process.argv, so we shift the
+  // subcommand name out so it sees the flags at argv[2+].
+  if (sub === "agentsmcp-index" || sub === "index") {
+    process.argv.splice(2, 1); // remove the subcommand, keep flags
+    // Dynamic require — the indexer is a self-contained script that calls
+    // main() on load. We use require() so it runs inline.
+    const indexerPath = require("path").resolve(__dirname, "../scripts/index-codebase.js");
+    try {
+      require(indexerPath);
+    } catch (e: unknown) {
+      // Fallback: try tsx for development (script is .ts, not compiled)
+      const tsPath = indexerPath.replace(/\.js$/, ".ts");
+      try {
+        require(tsPath);
+      } catch {
+        const msg = e instanceof Error ? e.message : String(e);
+        die(`cannot load codebase indexer: ${msg}`);
+      }
+    }
     return;
   }
 

@@ -7,7 +7,8 @@
   "bin": {
     "agentsmcp": "dist/mcp/index.js",
     "agentsmcp-server": "dist/server.js",
-    "agentmailbox-server": "dist/server.js"
+    "agentmailbox-server": "dist/server.js",
+    "agentsmcp-index": "dist/scripts/index-codebase.js"
   },
   "files": [
     "dist/",
@@ -15,7 +16,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm run clean && tsc && node scripts/finalize-mcp.js",
+    "build": "npm run clean && tsc && npx tsc scripts/index-codebase.ts --outDir dist/scripts --target ES2020 --module commonjs --esModuleInterop --skipLibCheck --resolveJsonModule && node scripts/finalize-mcp.js",
     "start": "ts-node src/server.ts",
     "example": "ts-node examples/basic.ts",
     "clean": "rm -rf dist",
