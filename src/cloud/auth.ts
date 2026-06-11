@@ -62,6 +62,61 @@ export function safeHashEquals(a: string, b: string): boolean {
   return timingSafeEqual(aBuf, bBuf);
 }
 
+// ---------------------------------------------------------------------------
+// Circuit breaker (for external dependencies, e.g. GitHub OAuth)
+// ---------------------------------------------------------------------------
+
+export interface CircuitBreakerOptions {
+  /** Consecutive failures before the circuit opens. Default 5. */
+  failureThreshold?: number;
+  /** How long the circuit stays open before a half-open probe. Default 30s. */
+  resetTimeoutMs?: number;
+}
+
+/** Thrown when the circuit is open and a call is rejected without executing. */
+export class CircuitOpenError extends Error {
+  constructor() {
+    super("circuit_open");
+    this.name = "CircuitOpenError";
+  }
+}
+
+/**
+ * Minimal in-memory circuit breaker. Opens after `failureThreshold`
+ * consecutive failures; after `resetTimeoutMs` it half-opens, letting one
+ * probe call through — success closes the circuit, failure re-opens it.
+ */
+export class CircuitBreaker {
+  private failures = 0;
+  private openedAt = 0;
+  private readonly threshold: number;
+  private readonly resetMs: number;
+
+  constructor(opts: CircuitBreakerOptions = {}) {
+    this.threshold = opts.failureThreshold ?? 5;
+    this.resetMs = opts.resetTimeoutMs ?? 30_000;
+  }
+
+  get isOpen(): boolean {
+    if (this.failures < this.threshold) return false;
+    // Past the reset window → allow a half-open probe through.
+    return Date.now() - this.openedAt < this.resetMs;
+  }
+
+  async exec<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.isOpen) throw new CircuitOpenError();
+    try {
+      const result = await fn();
+      this.failures = 0;
+      return result;
+    } catch (e) {
+      this.failures += 1;
+      if (this.failures >= this.threshold) this.openedAt = Date.now();
+      throw e;
+    }
+  }
+}
+
 export interface VerifiedKey {
   userId: string;
   plan: string;

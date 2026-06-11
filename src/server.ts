@@ -35,6 +35,7 @@ import {
   signSession,
   verifySession,
   UPGRADE_URL,
+  CircuitBreaker,
 } from "./cloud/auth";
 import { recordAudit, getAuditTrail } from "./cloud/audit";
 import { PostgresStorage } from "./storage/postgres";
@@ -70,6 +71,19 @@ const DEFAULT_CLOUD_CORS_ORIGINS = [
 function parseQueryInt(raw: unknown, def: number, min: number, max: number): number {
   const n = Number(raw ?? def);
   return Number.isFinite(n) ? Math.min(Math.max(min, n), max) : def;
+}
+
+/**
+ * Wrap an async route handler so rejected promises propagate to the Express
+ * error middleware instead of becoming unhandled rejections. Existing routes
+ * use explicit try/catch + next(e); prefer this wrapper for new routes.
+ */
+export function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>
+) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 
 /**
@@ -546,6 +560,14 @@ export function createServer(
       Boolean(githubClientSecret) &&
       Boolean(sessionSecret);
 
+    // Circuit breaker around GitHub's token-exchange endpoint. After 5
+    // consecutive failures the callback fails fast for 30s instead of
+    // stacking up requests against a degraded external dependency.
+    const githubTokenBreaker = new CircuitBreaker({
+      failureThreshold: 5,
+      resetTimeoutMs: 30_000,
+    });
+
     if (!githubReady) {
       logger.warn(
         "GitHub OAuth env vars missing; /auth/github routes will 503"
@@ -664,28 +686,47 @@ export function createServer(
             return res.redirect(failUrl);
           }
 
-          // Exchange code → access_token.
-          const tokenRes = await fetch(
-            "https://github.com/login/oauth/access_token",
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Accept: "application/json",
-                "User-Agent": "agentsmcp",
-              },
-              body: JSON.stringify({
-                client_id: githubClientId,
-                client_secret: githubClientSecret,
-                code,
-                redirect_uri: githubCallbackUrl,
-              }),
-            }
-          );
-          const tokenJson = (await tokenRes.json()) as {
-            access_token?: string;
-            error?: string;
-          };
+          // Exchange code → access_token. Guarded by a circuit breaker and
+          // a 10s timeout so a degraded GitHub fails fast instead of piling
+          // up hanging requests.
+          let tokenJson: { access_token?: string; error?: string };
+          try {
+            tokenJson = await githubTokenBreaker.exec(async () => {
+              const tokenRes = await fetch(
+                "https://github.com/login/oauth/access_token",
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                    "User-Agent": "agentsmcp",
+                  },
+                  body: JSON.stringify({
+                    client_id: githubClientId,
+                    client_secret: githubClientSecret,
+                    code,
+                    redirect_uri: githubCallbackUrl,
+                  }),
+                  signal: AbortSignal.timeout(10_000),
+                }
+              );
+              if (!tokenRes.ok) {
+                throw new Error(
+                  `github token exchange failed with status ${tokenRes.status}`
+                );
+              }
+              return (await tokenRes.json()) as {
+                access_token?: string;
+                error?: string;
+              };
+            });
+          } catch (err) {
+            req.log.warn({ err }, "github token exchange unavailable");
+            const failUrl = cliRedirect
+              ? buildCliFailureUrl(cliRedirect, "token_exchange_failed", cliState)
+              : `${frontendUrl}/?auth_error=token_exchange_failed`;
+            return res.redirect(failUrl);
+          }
           if (!tokenJson.access_token) {
             return res.redirect(
               `${frontendUrl}/?auth_error=${encodeURIComponent(tokenJson.error ?? "token_exchange_failed")}`
@@ -1799,15 +1840,51 @@ export function createServer(
     }
   });
 
-  app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
-    (req.log ?? logger).error({ err }, "unhandled route error");
-    res.status(500).json({ error: err.message ?? "internal error" });
+  // Final error boundary. Operational errors (4xx — the caller's fault,
+  // e.g. malformed JSON body) are logged at warn and surface their message;
+  // programmer/internal errors (5xx) log the full stack and return a
+  // sanitized body in production so stacks and internals never leak.
+  app.use((
+    err: Error & { status?: number; statusCode?: number },
+    req: Request,
+    res: Response,
+    _next: NextFunction
+  ) => {
+    const rawStatus = err.status ?? err.statusCode;
+    const status =
+      typeof rawStatus === "number" && rawStatus >= 400 && rawStatus <= 599
+        ? rawStatus
+        : 500;
+    const requestId = req.id !== undefined ? String(req.id) : null;
+    const log = req.log ?? logger;
+    if (status >= 500) {
+      log.error({ err, requestId, stack: err.stack }, "unhandled route error");
+    } else {
+      log.warn({ err, requestId }, "request failed");
+    }
+    const isProd = process.env.NODE_ENV === "production";
+    const message =
+      status < 500 || !isProd
+        ? err.message ?? "internal error"
+        : "internal error";
+    res.status(status).json({ error: message, requestId });
   });
 
   return { app, storage, ready, rateLimiter };
 }
 
 if (require.main === module) {
+  // Last-resort process guards. Unhandled rejections are logged with full
+  // context but don't kill the process; uncaught exceptions exit non-zero
+  // so the orchestrator restarts a clean instance.
+  process.on("unhandledRejection", (reason) => {
+    logger.error({ err: reason }, "unhandled promise rejection");
+  });
+  process.on("uncaughtException", (err) => {
+    logger.fatal({ err }, "uncaught exception; exiting");
+    process.exit(1);
+  });
+
   const port = Number(process.env.PORT ?? 3000);
   const dbPath =
     readEnv("AGENTSMCP_DB", "AGENTMAILBOX_DB") ?? "agentmailbox.db";

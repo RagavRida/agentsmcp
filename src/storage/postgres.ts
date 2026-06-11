@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { v4 as uuidv4 } from "uuid";
+import { logger } from "../logger";
 import {
   Agent,
   AgentAddress,
@@ -38,10 +39,14 @@ interface PgPool {
   connect(): Promise<PgClient>;
   query<R = unknown>(text: string, params?: unknown[]): Promise<PgQueryResult<R>>;
   end(): Promise<void>;
+  /** pg.Pool is an EventEmitter; we only depend on the error event. */
+  on?(event: "error", listener: (err: Error) => void): void;
 }
 type PgPoolCtor = new (cfg: {
   connectionString: string;
   max?: number;
+  idleTimeoutMillis?: number;
+  connectionTimeoutMillis?: number;
   ssl?: boolean | { rejectUnauthorized?: boolean; ca?: string };
 }) => PgPool;
 
@@ -127,16 +132,49 @@ export class PostgresStorage implements Storage {
       this.pool = new Pool({
         connectionString: this.url,
         max: this.poolMax,
+        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 5_000,
         ...(ssl ? { ssl } : {}),
+      });
+      // An idle client erroring (RDS failover, connection reset) emits
+      // 'error' on the pool; without a listener Node treats that as an
+      // uncaught exception and kills the process. Log and carry on — the
+      // pool replaces broken clients on the next checkout.
+      this.pool.on?.("error", (err) => {
+        logger.error({ err }, "postgres pool error (idle client)");
       });
       return this.pool;
     })();
     return this.poolPromise;
   }
 
+  /**
+   * Acquire a client with retry — transient failures (DNS blip, RDS
+   * failover, connection timeout) back off exponentially instead of
+   * crashing the process: 3 retries at 500ms / 1s / 2s.
+   */
+  private async connectWithRetry(pool: PgPool, retries = 3): Promise<PgClient> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        return await pool.connect();
+      } catch (e) {
+        lastErr = e;
+        if (attempt === retries) break;
+        const delayMs = 500 * 2 ** attempt;
+        logger.warn(
+          { err: e, attempt: attempt + 1, retries, delayMs },
+          "postgres connect failed; retrying"
+        );
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+    throw lastErr;
+  }
+
   async init(): Promise<void> {
     const pool = await this.getPool();
-    const client = await pool.connect();
+    const client = await this.connectWithRetry(pool);
     try {
       await client.query("BEGIN");
       await client.query(`
