@@ -11,6 +11,7 @@ import {
 } from "./auth";
 import { ScopedStorage } from "./scoping";
 import { Storage } from "../storage/interface";
+import { logger } from "../logger";
 
 // Augment Express's request type so route handlers can pull `req.userId`
 // / `req.userPlan` / `req.storage` (the scoped Storage instance) with full
@@ -106,7 +107,7 @@ export function cloudAuth(opts: CloudAuthOptions) {
       return next();
     } catch (e) {
       // Never leak DB errors / stacks via auth failures.
-      console.error("[agentsmcp] cloudAuth error:", e);
+      logger.error({ err: e }, "cloudAuth error");
       return res.status(401).json({ error: "invalid_api_key" });
     }
   };

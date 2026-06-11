@@ -1,4 +1,5 @@
 import { PgPoolLike } from "./auth";
+import { logger } from "../logger";
 
 export interface AuditLogEntry {
   id: string;
@@ -48,7 +49,7 @@ export async function recordAudit(
       ]
     );
   } catch (err) {
-    console.error("[agentsmcp] failed to write audit log:", err);
+    logger.error({ err }, "failed to write audit log");
   }
 }
 

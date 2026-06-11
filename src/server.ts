@@ -10,6 +10,7 @@ import { createStorage, Storage } from "./storage";
 import { Compressor, NoopCompressor } from "./compression";
 import { assembleContext } from "./context";
 import { readEnv } from "./env";
+import { logger, createHttpLogger } from "./logger";
 import {
   createRateLimiter,
   RateLimiterHandle,
@@ -369,28 +370,11 @@ export function createServer(
 
   app.use(express.json({ limit: "10mb" }));
 
-  // Structured JSON logger middleware — only wired in cloudMode to avoid
-  // per-request closure overhead on self-hosted installs.
-  if (cloudMode) {
-    app.use((req: Request, res: Response, next: NextFunction) => {
-      const start = Date.now();
-      res.on("finish", () => {
-        console.log(JSON.stringify({
-          timestamp: new Date().toISOString(),
-          type: "request",
-          method: req.method,
-          path: req.path,
-          ip: req.ip,
-          userAgent: req.headers["user-agent"] ?? null,
-          status: res.statusCode,
-          durationMs: Date.now() - start,
-          userId: req.userId ?? null,
-          apiKeyId: req.apiKeyId ?? null,
-        }));
-      });
-      next();
-    });
-  }
+  // Structured request logging (pino-http). `req.log` is always attached so
+  // any handler can emit request-correlated logs; automatic per-request
+  // completion lines are emitted only in cloudMode to keep self-hosted
+  // installs quiet by default.
+  app.use(createHttpLogger({ autoLogging: cloudMode }));
 
   app.get("/health", (_req: Request, res: Response) => {
     res.json({ ok: true });
@@ -563,8 +547,8 @@ export function createServer(
       Boolean(sessionSecret);
 
     if (!githubReady) {
-      console.warn(
-        "[agentsmcp] GitHub OAuth env vars missing; /auth/github routes will 503"
+      logger.warn(
+        "GitHub OAuth env vars missing; /auth/github routes will 503"
       );
     }
 
@@ -1178,7 +1162,7 @@ export function createServer(
       if (req.userId && storage instanceof PostgresStorage) {
         const pool = await storage.getRawPool();
         recordMessageSent(pool as unknown as PgPoolLike, req.userId).catch(
-          (err) => console.error("[agentsmcp] usage_metrics upsert failed:", err)
+          (err) => req.log.error({ err }, "usage_metrics upsert failed")
         );
       }
 
@@ -1248,7 +1232,7 @@ export function createServer(
       if (req.userId && storage instanceof PostgresStorage) {
         const pool = await storage.getRawPool();
         recordMessageSent(pool as unknown as PgPoolLike, req.userId).catch(
-          (err) => console.error("[agentsmcp] usage_metrics upsert failed:", err)
+          (err) => req.log.error({ err }, "usage_metrics upsert failed")
         );
       }
 
@@ -1815,8 +1799,8 @@ export function createServer(
     }
   });
 
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    console.error("[agentsmcp] error:", err);
+  app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+    (req.log ?? logger).error({ err }, "unhandled route error");
     res.status(500).json({ error: err.message ?? "internal error" });
   });
 
@@ -1831,12 +1815,11 @@ if (require.main === module) {
   ready
     .then(() => {
       app.listen(port, () => {
-        console.log(`[agentsmcp] server listening on http://localhost:${port}`);
-        console.log(`[agentsmcp] db: ${dbPath}`);
+        logger.info({ port, dbPath }, `server listening on http://localhost:${port}`);
       });
     })
     .catch((e) => {
-      console.error("[agentsmcp] failed to initialize storage:", e);
+      logger.fatal({ err: e }, "failed to initialize storage");
       process.exit(1);
     });
 }
