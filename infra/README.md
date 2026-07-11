@@ -8,6 +8,30 @@ login to create the isolated IAM user.
 This is the *hosted* path. Self-hosters skip it and run sqlite locally
 or point `AGENTSMCP_DB` at any Postgres URL.
 
+## Colima on macOS
+
+Colima is the supported local container runtime for macOS. The Colima stack
+uses Modal for GLM inference and embeddings because macOS/Colima cannot expose
+an NVIDIA GPU to the Linux vLLM container.
+
+```bash
+brew install colima docker docker-compose
+cp infra/colima/.env.colima.example infra/colima/.env.colima
+# Populate secrets, Modal endpoints, and TLS file paths from your secret manager.
+bash infra/colima/deploy-colima.sh
+```
+
+The launcher starts Colima when needed, selects the `colima` Docker context,
+builds the application, and starts the private PostgreSQL, Neo4j, and MinIO
+services. Only the Nginx HTTPS proxy publishes host ports.
+
+The Colima initializer creates a local development CA and localhost server
+certificate. To make Chrome trust `https://localhost:8443` on macOS, run:
+
+```bash
+./infra/colima/trust-local-cert.sh
+```
+
 ---
 
 ## What gets created
@@ -166,3 +190,25 @@ aws iam delete-user --user-name agentsmcp-deploy
 For real free-tier operation, stop the RDS instance overnight or
 auto-stop when idle — `db.t3.micro` is billable while running, not
 while stopped.
+
+## Backup and recovery
+
+RDS is provisioned with seven days of automated backups. For self-managed
+PostgreSQL, run the checked-in dump job from a scheduler with credentials
+provided by your secret manager:
+
+```bash
+PGHOST=... PGDATABASE=agentsmcp PGUSER=... PGPASSWORD=... \
+  BACKUP_DIR=/secure/backups ./infra/backup-postgres.sh
+```
+
+Recovery must be tested regularly, not only when an incident occurs:
+
+```bash
+BACKUP_FILE=/secure/backups/agentsmcp-latest.dump \
+PGHOST=... PGUSER=... PGPASSWORD=... \
+  ./infra/test-postgres-restore.sh
+```
+
+The restore script creates a temporary database, restores the dump with
+`pg_restore --exit-on-error`, and removes the temporary database afterward.

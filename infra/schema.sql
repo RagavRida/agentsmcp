@@ -453,6 +453,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     deleted_count INTEGER := 0;
+    affected_count INTEGER := 0;
     r RECORD;
 BEGIN
     FOR r IN
@@ -467,7 +468,8 @@ BEGIN
           AND t.user_id = r.user_id
           AND m.created_at < NOW() - (r.retention_days || ' days')::interval;
 
-        GET DIAGNOSTICS deleted_count = deleted_count + ROW_COUNT;
+        GET DIAGNOSTICS affected_count = ROW_COUNT;
+        deleted_count := deleted_count + affected_count;
     END LOOP;
 
     -- Clean up empty threads (no messages left)
@@ -597,7 +599,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_commits_agent
 ALTER TABLE threads ADD COLUMN IF NOT EXISTS participants_hash TEXT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_participants_hash
-  ON threads(participants_hash, user_id)
+  ON threads(participants_hash, user_id) NULLS NOT DISTINCT
   WHERE participants_hash IS NOT NULL;
 
 -- ============================================================================

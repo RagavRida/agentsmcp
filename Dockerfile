@@ -7,11 +7,12 @@ WORKDIR /app
 # Install build dependencies for better-sqlite3's native module.
 RUN apk add --no-cache python3 make g++ libc6-compat
 
-COPY package.json package-lock.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json tsconfig.ui.json vite.config.ts ./
 RUN npm ci --no-audit --no-fund
 
 COPY src ./src
-RUN npx tsc
+COPY ui ./ui
+RUN npx tsc && npm run build:web
 
 # Prune to production dependencies for the runtime stage.
 RUN npm prune --omit=dev
@@ -30,6 +31,7 @@ RUN addgroup -S agentsmcp && adduser -S agentsmcp -G agentsmcp
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/ui/dist ./ui/dist
 COPY --from=build /app/package.json ./package.json
 
 # App Runner hits port 8080 by default; honour PORT if explicitly set.
