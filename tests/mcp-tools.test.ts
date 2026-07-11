@@ -8,9 +8,9 @@ let server: TestServer;
 let agent: AgentMailbox;
 
 describe("MCP tools — listToolDefs", () => {
-  it("returns all 24 tool definitions with valid schemas", () => {
+  it("returns all 31 tool definitions with valid schemas", () => {
     const tools = listToolDefs();
-    expect(tools.length).toBe(24);
+    expect(tools.length).toBe(49);
 
     // Every tool has the expected shape
     for (const t of tools) {
@@ -27,29 +27,54 @@ describe("MCP tools — listToolDefs", () => {
     const names = listToolDefs().map((t) => t.name).sort();
     expect(names).toEqual([
       "agentsmcp_add_edge",
+      "agentsmcp_analyze_legacy_impact",
       "agentsmcp_annotate_file",
       "agentsmcp_check_staleness",
       "agentsmcp_context_briefing",
+      "agentsmcp_declare_interest",
+      "agentsmcp_forget",
+      "agentsmcp_generate_training_data",
+      "agentsmcp_get_chunk_neighbors",
       "agentsmcp_get_index",
+      "agentsmcp_get_learned_rules",
       "agentsmcp_git_commit",
       "agentsmcp_git_diff",
       "agentsmcp_git_log",
       "agentsmcp_git_restore",
+      "agentsmcp_health",
+      "agentsmcp_impact_analysis",
+      "agentsmcp_improve",
+      "agentsmcp_learn_rules",
+      "agentsmcp_list_data",
       "agentsmcp_mark_read",
+      "agentsmcp_parse_cobol",
+      "agentsmcp_parse_jcl",
+      "agentsmcp_parse_pli",
+      "agentsmcp_parse_rexx",
       "agentsmcp_participants",
       "agentsmcp_post_edit_annotate",
+      "agentsmcp_prune",
+      "agentsmcp_query_deepseek",
       "agentsmcp_query_graph",
+      "agentsmcp_recall",
       "agentsmcp_receive",
+      "agentsmcp_remember",
       "agentsmcp_reply_all",
       "agentsmcp_rollup_module",
+      "agentsmcp_run_eval",
+      "agentsmcp_run_optimize_loop",
+      "agentsmcp_save_interaction",
       "agentsmcp_search_index",
+      "agentsmcp_semantic_search",
       "agentsmcp_send",
       "agentsmcp_session_start",
       "agentsmcp_sync",
+      "agentsmcp_task_status",
       "agentsmcp_threads",
       "agentsmcp_unread",
       "agentsmcp_upsert_index",
       "agentsmcp_upsert_node",
+      "agentsmcp_usage_stats",
     ]);
   });
 });

@@ -174,7 +174,9 @@ export class ScopedStorage implements Storage {
       const tRes = await client.query<ThreadRow>(
         `INSERT INTO threads (id, user_id, participants_hash)
          VALUES ($1, $2, $3)
-         ON CONFLICT (participants_hash, user_id) DO NOTHING
+         ON CONFLICT (participants_hash, user_id)
+           WHERE participants_hash IS NOT NULL
+         DO NOTHING
          RETURNING id, created_at, updated_at`,
         [id, this.userId, participantsHash]
       );
@@ -1255,6 +1257,21 @@ export class ScopedStorage implements Storage {
 
     const mergeMsg = opts?.message ?? `Merge '${fromBranch}' into '${toBranch}' (${strategy})`;
     return this.createCommit(agentId, mergeMsg, { branch: toBranch });
+  }
+  // ---------- Active Learning Rules ----------
+
+  async upsertLearnedRule(
+    agentId: AgentAddress,
+    rule: import("../storage/interface").LearnedRule
+  ): Promise<void> {
+    throw new Error("Active Learning rules not yet supported on Cloud");
+  }
+
+  async getLearnedRules(
+    agentId: AgentAddress,
+    category?: string
+  ): Promise<import("../storage/interface").LearnedRule[]> {
+    throw new Error("Active Learning rules not yet supported on Cloud");
   }
 }
 

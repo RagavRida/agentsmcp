@@ -89,9 +89,17 @@ export interface Mailbox {
 export interface SendOptions {
   threadId?: string;
   contextSnapshot?: Record<string, unknown>;
+  handoff?: HandoffOptions;
   cc?: AgentAddress[];
   bcc?: AgentAddress[];
   replyTo?: AgentAddress;
+}
+
+export interface HandoffOptions {
+  goal?: string;
+  nextAction?: string;
+  includeFields?: string[];
+  maxContextBytes?: number;
 }
 
 export interface ReceiveResult {

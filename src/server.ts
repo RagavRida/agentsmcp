@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomBytes, timingSafeEqual } from "crypto";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
@@ -11,6 +11,9 @@ import { v4 as uuidv4 } from "uuid";
 import { createStorage, Storage } from "./storage";
 import { Compressor, NoopCompressor } from "./compression";
 import { assembleContext } from "./context";
+import { validateProductionConfig } from "./config/production";
+import { defaultMetrics } from "./observability/metrics";
+import { buildHandoffContext } from "./handoff/context-builder";
 import { readEnv } from "./env";
 import { logger, createHttpLogger } from "./logger";
 import {
@@ -261,6 +264,12 @@ const SendSchema = z.object({
   cc: z.array(z.string().min(1)).optional(),
   bcc: z.array(z.string().min(1)).optional(),
   replyTo: z.string().min(1).optional(),
+  handoff: z.object({
+    goal: z.string().min(1).optional(),
+    nextAction: z.string().min(1).optional(),
+    includeFields: z.array(z.string().min(1)).max(100).optional(),
+    maxContextBytes: z.number().int().min(256).max(1_000_000).optional(),
+  }).optional(),
 });
 
 const ReplyAllSchema = z.object({
@@ -268,6 +277,12 @@ const ReplyAllSchema = z.object({
   threadId: z.string().min(1),
   payload: z.unknown(),
   contextSnapshot: z.record(z.unknown()).optional(),
+  handoff: z.object({
+    goal: z.string().min(1).optional(),
+    nextAction: z.string().min(1).optional(),
+    includeFields: z.array(z.string().min(1)).max(100).optional(),
+    maxContextBytes: z.number().int().min(256).max(1_000_000).optional(),
+  }).optional(),
 });
 
 const MarkReadSchema = z.object({
@@ -371,6 +386,8 @@ export function createServer(
       .match(/^(1|true|yes|on)$/) !== null);
 
   const app = express();
+  const metrics = defaultMetrics;
+  app.use(metrics.middleware());
   let cloudPool: PgPoolLike | null = null;
 
   if (cloudMode) {
@@ -485,6 +502,21 @@ export function createServer(
     }
   );
 
+  const uiDistPath = join(__dirname, "..", "ui", "dist");
+  const uiIndexPath = join(uiDistPath, "index.html");
+  if (existsSync(uiIndexPath)) {
+    app.use(
+      express.static(uiDistPath, {
+        fallthrough: true,
+        index: "index.html",
+        maxAge: process.env.NODE_ENV === "production" ? "1h" : 0,
+      })
+    );
+    app.get(/^\/(?!api\/|auth\/|mailbox\/|messages\/|agents\/|threads\/|metrics$|usage\/|health$|ready$|\.well-known\/).*/, (_req, res) => {
+      res.sendFile(uiIndexPath);
+    });
+  }
+
   const requireApiKey = (req: Request, res: Response, next: NextFunction) => {
     if (!apiKey) return next();
     if (req.path === "/health") return next();
@@ -500,6 +532,10 @@ export function createServer(
     return next();
   };
   app.use(requireApiKey);
+
+  app.get("/metrics", (_req: Request, res: Response) => {
+    res.type("text/plain").send(metrics.toPrometheus());
+  });
 
   // Cloud-tier rate limiting. Spec: skip entirely when AGENTSMCP_API_KEY is
   // set (self-hosted operator) — they're past the soft caps by definition.
@@ -1174,7 +1210,7 @@ export function createServer(
       if (!parsed.success) {
         return res.status(400).json({ error: parsed.error.flatten() });
       }
-      const { from, to, payload, contextSnapshot, threadId, cc, bcc, replyTo } =
+      const { from, to, payload, contextSnapshot, threadId, cc, bcc, replyTo, handoff } =
         parsed.data;
       const s = storageFor(req);
 
@@ -1205,7 +1241,14 @@ export function createServer(
         from,
         to,
         payload,
-        contextSnapshot: contextSnapshot ?? {},
+        contextSnapshot: handoff
+          ? buildHandoffContext({
+              messages: thread.messages,
+              sourceThreadId: thread.id,
+              snapshot: contextSnapshot,
+              options: handoff,
+            })
+          : contextSnapshot ?? {},
         timestamp: Date.now(),
       };
       if (cc && cc.length > 0) message.cc = cc;
@@ -1269,7 +1312,7 @@ export function createServer(
       if (!parsed.success) {
         return res.status(400).json({ error: parsed.error.flatten() });
       }
-      const { from, threadId, payload, contextSnapshot } = parsed.data;
+      const { from, threadId, payload, contextSnapshot, handoff } = parsed.data;
       const s = storageFor(req);
 
       const thread = await s.getThread(threadId);
@@ -1291,7 +1334,14 @@ export function createServer(
         from,
         to: primary,
         payload,
-        contextSnapshot: contextSnapshot ?? {},
+        contextSnapshot: handoff
+          ? buildHandoffContext({
+              messages: thread.messages,
+              sourceThreadId: thread.id,
+              snapshot: contextSnapshot,
+              options: handoff,
+            })
+          : contextSnapshot ?? {},
         timestamp: Date.now(),
       };
       if (rest.length > 0) message.cc = rest;
@@ -1926,6 +1976,13 @@ if (require.main === module) {
     process.exit(1);
   });
 
+  try {
+    validateProductionConfig();
+  } catch (err) {
+    logger.fatal({ err }, "invalid production configuration");
+    process.exit(1);
+  }
+
   const port = Number(process.env.PORT ?? 3000);
   const dbPath =
     readEnv("AGENTSMCP_DB", "AGENTMAILBOX_DB") ?? "agentmailbox.db";
@@ -1933,7 +1990,12 @@ if (require.main === module) {
   ready
     .then(() => {
       const httpServer = app.listen(port, () => {
-        logger.info({ port, dbPath }, `server listening on http://localhost:${port}`);
+        const storageBackend = /^postgres(?:ql)?:\/\//i.test(dbPath)
+          ? "postgresql"
+          : dbPath === ":memory:"
+            ? "memory"
+            : "sqlite";
+        logger.info({ port, storageBackend }, `server listening on http://localhost:${port}`);
       });
 
       // ---- Graceful shutdown ----

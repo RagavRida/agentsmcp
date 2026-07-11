@@ -12,11 +12,14 @@
   },
   "files": [
     "dist/",
+    "ui/",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm run clean && tsc && npx tsc scripts/index-codebase.ts --outDir dist/scripts --target ES2020 --module commonjs --esModuleInterop --skipLibCheck --resolveJsonModule && node scripts/finalize-mcp.js",
+    "build": "cd parser && npx tsc -p tsconfig.cjs.json && cd .. && npm run clean && tsc && npx tsc scripts/index-codebase.ts --outDir dist/scripts --target ES2020 --module commonjs --esModuleInterop --skipLibCheck --resolveJsonModule && node scripts/finalize-mcp.js && npm run build:web",
+    "build:web": "vite build && tsc -p tsconfig.ui.json --noEmit",
+    "eval:llm-judge": "ts-node scripts/run-llm-judge.ts",
     "start": "ts-node src/server.ts",
     "example": "ts-node examples/basic.ts",
     "clean": "rm -rf dist",
@@ -47,6 +50,8 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1075.0",
+    "@aws-sdk/s3-request-presigner": "^3.1075.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^11.3.0",
     "cors": "^2.8.6",
@@ -54,9 +59,13 @@
     "express-rate-limit": "^8.5.2",
     "helmet": "^8.2.0",
     "jsonwebtoken": "^9.0.3",
+    "lucide-react": "^1.24.0",
+    "neo4j-driver": "^6.1.0",
     "pg": "^8.11.0",
     "pino": "^9.5.0",
     "pino-http": "^10.3.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "uuid": "^10.0.0",
     "zod": "^3.23.8",
     "zod-to-json-schema": "^3.23.0"
@@ -81,11 +90,15 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.5.0",
     "@types/pg": "^8.20.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "@types/uuid": "^10.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
     "openai": "^4.50.0",
     "pino-pretty": "^11.3.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.4",
+    "vite": "^5.4.21",
     "vitest": "^2.0.0"
   }
 }

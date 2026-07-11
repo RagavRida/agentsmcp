@@ -13,6 +13,15 @@ export type {
 } from "./interface";
 export { SqliteStorage } from "./sqlite";
 export { PostgresStorage, type PostgresStorageOptions } from "./postgres";
+export {
+  LocalStorageAdapter,
+  S3StorageAdapter,
+  createStorageAdapterFromEnv,
+  type LocalStorageAdapterOptions,
+  type S3StorageAdapterOptions,
+  type StorageAdapter,
+  type StorageData,
+} from "./interfaces";
 
 function normalize(opts: string | StorageOptions): StorageOptions {
   return typeof opts === "string" ? { url: opts } : opts;

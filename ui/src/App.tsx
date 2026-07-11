@@ -1,0 +1,125 @@
+import { FormEvent, useMemo, useState } from "react";
+import {
+  Activity, ArrowUp, Bot, ChevronDown, ChevronRight, CircleHelp, Database,
+  FileCode2, FileInput, Files, GitBranch, LayoutGrid, Maximize2, Menu,
+  Minus, MoreHorizontal, Network, Plus, Search, Settings2, Sparkles, X, ZoomIn,
+} from "lucide-react";
+
+type View = "chat" | "programs" | "dataflow" | "relationships" | "explanation" | "knowledge" | "settings";
+type GraphMode = "Graph" | "Flow" | "Files";
+type Node = { id: string; x: number; y: number; label: string; type: string; description: string; program: string };
+type Message = { role: "assistant" | "user"; text: string; detail?: string; source?: string };
+
+const API_BASE = (window as Window & { AGENTMAILBOX_API?: string }).AGENTMAILBOX_API ?? "";
+const nodes: Node[] = [
+  { id: "WS-PGMNAME", x: 410, y: 115, label: "WS-PGMNAME", type: "Variable", description: "Program identifier referenced by the claims processing workflow.", program: "READCUST" },
+  { id: "LOCKUP-ACCT", x: 245, y: 230, label: "Lookup ACCT", type: "Data access", description: "Account lookup used by customer validation.", program: "READCUST" },
+  { id: "STEP-05R", x: 420, y: 305, label: "Step-05R", type: "Job step", description: "Reads customer data before the downstream claim decision.", program: "READCUST" },
+  { id: "XREFFILE-STATUS", x: 625, y: 250, label: "XREFFILE-STATUS", type: "Dataset", description: "Cross-reference status written by the validation step.", program: "READCUST" },
+  { id: "TIMING", x: 535, y: 445, label: "TIMING", type: "Control flow", description: "Timing branch used for the current job execution.", program: "READCUST" },
+  { id: "CVTRA-12", x: 590, y: 105, label: "CVTRA-12", type: "Copybook", description: "Shared transaction definitions from the copybook estate.", program: "READCUST" },
+  { id: "001-FILES", x: 270, y: 455, label: "001-files", type: "File", description: "Input file collection attached to the job.", program: "READCUST" },
+  { id: "LK-M03B", x: 665, y: 155, label: "LK-M03B", type: "Paragraph", description: "Downstream paragraph invoked by the workflow.", program: "READCUST" },
+];
+const edges = [["WS-PGMNAME", "CVTRA-12"], ["WS-PGMNAME", "STEP-05R"], ["CVTRA-12", "LK-M03B"], ["LK-M03B", "XREFFILE-STATUS"], ["STEP-05R", "LOCKUP-ACCT"], ["STEP-05R", "XREFFILE-STATUS"], ["STEP-05R", "TIMING"], ["LOCKUP-ACCT", "001-FILES"], ["XREFFILE-STATUS", "TIMING"]];
+
+const initialMessages: Message[] = [
+  { role: "assistant", text: "The copybook CV CUS01Y is used in the job READCUST, specifically within STEP05.", detail: "This step executes CBUSC01C, which handles customer data and reads the customer dataset." },
+  { role: "user", text: "How is interest calculated?" },
+  { role: "assistant", text: "(Balance × Interest Rate) ÷ 1200", detail: "Interest uses the account balance and annual rate. The division by 1200 converts the yearly percentage into a monthly amount.", source: "COMPUTE-INTEREST · LOAN-CALC.cbl: 84" },
+];
+
+function App() {
+  const [view, setView] = useState<View>("chat");
+  const [graphMode, setGraphMode] = useState<GraphMode>("Graph");
+  const [selectedId, setSelectedId] = useState("WS-PGMNAME");
+  const [scale, setScale] = useState(1);
+  const [messages, setMessages] = useState(initialMessages);
+  const [query, setQuery] = useState("");
+  const [importOpen, setImportOpen] = useState(false);
+  const [mobileNav, setMobileNav] = useState(false);
+  const [importStatus, setImportStatus] = useState("");
+  const selected = nodes.find((node) => node.id === selectedId) ?? nodes[0];
+  const connectedIds = useMemo(() => new Set([selectedId, ...edges.filter(([a, b]) => a === selectedId || b === selectedId).flat()]), [selectedId]);
+
+  function submitSearch(event?: FormEvent) {
+    event?.preventDefault();
+    const cleanQuery = query.trim();
+    if (!cleanQuery) return;
+    setMessages((current) => [...current, { role: "user", text: cleanQuery }]);
+    setQuery("");
+    void search(cleanQuery);
+  }
+
+  async function search(cleanQuery: string) {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/graph/search?query=${encodeURIComponent(cleanQuery)}&limit=8`);
+      const payload = await response.json();
+      const result = payload.results?.[0];
+      if (response.ok && result) {
+        const match = nodes.find((node) => node.id === result.id);
+        if (match) setSelectedId(match.id);
+        setMessages((current) => [...current, { role: "assistant", text: result.description, source: `${result.program} · ${result.type}` }]);
+        return;
+      }
+    } catch {
+      // The demo graph remains useful when the API is unavailable during local setup.
+    }
+    const term = cleanQuery.toLowerCase().split(/[^a-z0-9]+/).filter((item) => item.length > 2);
+    const match = nodes.find((node) => term.some((item) => `${node.label} ${node.description} ${node.type} ${node.program}`.toLowerCase().includes(item)));
+    if (match) {
+      setSelectedId(match.id);
+      setMessages((current) => [...current, { role: "assistant", text: `Demo graph context: ${match.description}`, source: `${match.program} · ${match.type}` }]);
+    } else {
+      setMessages((current) => [...current, { role: "assistant", text: "No indexed rule matches that query yet. Import a program to build grounded knowledge for this workspace." }]);
+    }
+  }
+
+  async function extract(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setImportStatus("Extracting deterministic knowledge…");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/extract`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename: form.get("filename"), code: form.get("code") }) });
+      if (!response.ok) throw new Error("Extraction failed");
+      const result = await response.json();
+      setImportStatus(`Indexed ${result.programName ?? "program"}. Search it from the workspace.`);
+    } catch {
+      setImportStatus("The memory API is unavailable. Start the AgentMailbox server and try again.");
+    }
+  }
+
+  const nav = [
+    { label: "Chat", view: "chat" as View, icon: Bot, count: 3 },
+    { label: "Graphs", view: "programs" as View, icon: Network, expandable: true },
+    { label: "Programs", view: "programs" as View, icon: FileCode2, child: true },
+    { label: "Data flow", view: "dataflow" as View, icon: GitBranch, child: true },
+    { label: "File relationships", view: "relationships" as View, icon: Files, child: true },
+    { label: "AI explanation", view: "explanation" as View, icon: Sparkles, child: true },
+    { label: "Knowledge base", view: "knowledge" as View, icon: Database, expandable: true },
+  ];
+
+  return <div className="app-shell">
+    <button className="mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={18} /></button>
+    <aside className={`sidebar ${mobileNav ? "is-open" : ""}`}>
+      <div className="brand"><span className="brand-mark">N</span><span>AgentMailbox</span><button className="mobile-close" aria-label="Close navigation" onClick={() => setMobileNav(false)}><X size={17} /></button></div>
+      <button className="workspace-switcher"><span className="status-dot" /> <span>Legacy estate</span><ChevronDown size={15} /></button>
+      <div className="nav-label">Workspace</div>
+      <nav className="nav-list">{nav.map(({ label, view: navView, icon: Icon, child, count, expandable }) => <button key={`${label}-${navView}`} className={`nav-item ${child ? "nav-child" : ""} ${view === navView ? "is-active" : ""}`} onClick={() => { setView(navView); setMobileNav(false); }}><Icon size={child ? 15 : 16} strokeWidth={1.8} /><span>{label}</span>{count && <span className="nav-count">{count}</span>}{expandable && <ChevronDown className="nav-end-icon" size={14} />}</button>)}</nav>
+      <div className="sidebar-spacer" />
+      <nav className="nav-list sidebar-lower"><div className="nav-label">Admin</div><button className="nav-item" onClick={() => setView("settings")}><Settings2 size={16} /><span>Settings</span><ChevronRight className="nav-end-icon" size={14} /></button><button className="nav-item is-disabled"><CircleHelp size={16} /><span>Support</span></button></nav>
+      <div className="sidebar-footer"><span className="status-dot" /><div><strong>Index connected</strong><small>Local workspace</small></div><button className="icon-button" aria-label="More workspace actions"><MoreHorizontal size={17} /></button></div>
+    </aside>
+    {mobileNav && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
+    <main className="main-panel">
+      <header className="topbar"><div className="breadcrumbs"><button className="icon-button desktop-only" aria-label="Toggle navigation"><LayoutGrid size={16} /></button><span>Workspace</span><ChevronRight size={14} /><strong>{view === "chat" ? "Claims processing workflow" : nav.find((item) => item.view === view)?.label}</strong></div><div className="top-actions"><span className="index-health"><span className="status-dot" /> Live index <span className="health-divider" /> 8 entities</span><button className="outline-button" onClick={() => setImportOpen(true)}><FileInput size={15} /> Import source</button><button className="avatar" aria-label="Open account menu">R</button></div></header>
+      <section className="workspace">
+        <section className="chat-column"><div className="section-heading"><div><div className="eyebrow">Knowledge chat</div><h1>Understand your estate</h1><p>Ask questions grounded in parsed source and dependency context.</p></div><button className="icon-button" aria-label="More chat options"><MoreHorizontal size={18} /></button></div><div className="conversation" id="message-list">{messages.map((message, index) => <article className={`message ${message.role}`} key={`${message.text}-${index}`}>{message.role === "assistant" && <div className="message-meta"><span className="mini-mark"><Bot size={14} /></span><span>AgentMailbox</span><time>Now</time></div>}<p>{message.text}</p>{message.detail && <p className="message-detail">{message.detail}</p>}{message.source && <div className="source-chip"><span><FileCode2 size={12} /> {message.source}</span><ChevronRight size={14} /></div>}{message.role === "assistant" && index === 0 && <button className="inline-action" onClick={() => setSelectedId("STEP-05R")}><Sparkles size={13} /> Highlight related nodes</button>}{message.role === "user" && <time>Now</time>}</article>)}</div><form className="composer" onSubmit={submitSearch}><div className="composer-label"><Search size={15} /><span>Ask the knowledge layer</span></div><textarea value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submitSearch(); }} rows={2} placeholder="Ask about a program, rule, or dependency…" aria-label="Ask AgentMailbox" /><div className="composer-footer"><span>⌘ Enter to search</span><button className="send-button" aria-label="Search knowledge graph"><ArrowUp size={17} /></button></div></form></section>
+        <section className="graph-column"><div className="graph-header"><div><div className="eyebrow">Dependency map</div><h2>Claims processing workflow</h2><span className="graph-meta"><Activity size={13} /> Live relationship view · updated just now</span></div><div className="graph-header-actions"><button className="icon-button" aria-label="Graph options"><MoreHorizontal size={18} /></button></div></div><div className="graph-toolbar"><div className="segmented" role="tablist">{(["Graph", "Flow", "Files"] as GraphMode[]).map((mode) => <button key={mode} className={graphMode === mode ? "is-active" : ""} onClick={() => setGraphMode(mode)} role="tab" aria-selected={graphMode === mode}>{mode}</button>)}</div><div className="graph-tools"><button className="icon-button" aria-label="Zoom in" onClick={() => setScale((current) => Math.min(1.35, current + .1))}><Plus size={16} /></button><button className="icon-button" aria-label="Zoom out" onClick={() => setScale((current) => Math.max(.75, current - .1))}><Minus size={16} /></button><button className="icon-button" aria-label="Fit graph" onClick={() => setScale(1)}><Maximize2 size={15} /></button></div></div><div className="graph-canvas"><svg viewBox="0 0 760 620" role="img" aria-label="Interactive business dependency graph"><g transform={`scale(${scale})`}>{edges.map(([from, to]) => { const a = nodes.find((node) => node.id === from)!; const b = nodes.find((node) => node.id === to)!; return <line key={`${from}-${to}`} className={connectedIds.has(from) && connectedIds.has(to) ? "graph-line is-connected" : "graph-line"} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />; })}{nodes.map((node) => <g key={node.id} className={`graph-node ${node.id === selectedId ? "is-selected" : ""}`} transform={`translate(${node.x} ${node.y})`} onClick={() => setSelectedId(node.id)} tabIndex={0} role="button" aria-label={`Select ${node.label}`}><circle r={node.id === selectedId ? 9 : 5} /><text x="13" y="4">{node.label}</text></g>)}</g></svg><div className="graph-legend"><span><i className="legend-dot green" /> Selected path</span><span><i className="legend-dot gray" /> Related entity</span></div><div className="graph-zoom">{Math.round(scale * 100)}%</div></div><aside className="node-inspector"><div className="inspector-heading"><span className="eyebrow">Selected entity</span><button className="icon-button" aria-label="Close inspector"><X size={15} /></button></div><div className="inspector-title"><span className="selected-dot" /><strong>{selected.label}</strong></div><p>{selected.description}</p><div className="inspector-grid"><div><span>Type</span><strong>{selected.type}</strong></div><div><span>Program</span><strong>{selected.program}</strong></div><div><span>Connections</span><strong>{connectedIds.size - 1} related</strong></div></div><button className="dark-button" onClick={() => { setQuery(`Explain ${selected.label}`); setView("chat"); }}>Open explanation <ArrowUp size={15} /></button></aside></section>
+      </section>
+    </main>
+    {importOpen && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><form onSubmit={extract}><div className="modal-header"><div><div className="eyebrow">Add to knowledge layer</div><h2 id="import-title">Import mainframe source</h2><p>Parse a program into searchable rules and dependency context.</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)} aria-label="Close import dialog"><X size={18} /></button></div><label>Filename<input name="filename" defaultValue="LOAN-CALC.cbl" required /></label><label>Source<textarea name="code" rows={10} placeholder="Paste COBOL, JCL, PL/I, or REXX source…" required /></label>{importStatus && <div className={`modal-status ${importStatus.startsWith("The") ? "is-error" : ""}`}>{importStatus}</div>}<div className="modal-actions"><button type="button" className="outline-button" onClick={() => setImportOpen(false)}>Cancel</button><button className="dark-button" type="submit">Extract knowledge <ArrowUp size={15} /></button></div></form></div></div>}
+  </div>;
+}
+
+export default App;

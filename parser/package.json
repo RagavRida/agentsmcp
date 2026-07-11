@@ -1,0 +1,16 @@
+{
+  "name": "@agentmailbox/mainframe-parser",
+  "version": "0.1.0",
+  "description": "Deterministic JCL + COBOL AST parser with Knowledge Graph extraction — zero LLM calls",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --loader ts-node/esm src/index.ts",
+    "demo": "npx tsx src/index.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "tsx": "^4.7.0"
+  }
+}

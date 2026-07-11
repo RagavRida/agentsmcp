@@ -296,6 +296,28 @@ export interface Storage {
     toBranch: string,
     opts?: { strategy?: "union" | "ours" | "theirs"; message?: string }
   ): Promise<AgentCommit>;
+
+  // ---------- Active Learning Rules ----------
+
+  /**
+   * Save a newly extracted coding rule, optionally tied to an AST node.
+   */
+  upsertLearnedRule(agentId: AgentAddress, rule: LearnedRule): Promise<void>;
+
+  /**
+   * Get rules for a specific AST node or global rules (if astNodeId is undefined).
+   */
+  getLearnedRules(agentId: AgentAddress, astNodeId?: string): Promise<LearnedRule[]>;
+}
+
+// ---------- Active Learning Rules types ----------
+
+export interface LearnedRule {
+  id: string;
+  description: string;
+  category: "style" | "architecture" | "business_logic" | "migration";
+  astNodeId?: string; // Optional: Link it to a specific COBOL paragraph or variable
+  createdAt: number;
 }
 
 // ---------- Context Graph types ----------

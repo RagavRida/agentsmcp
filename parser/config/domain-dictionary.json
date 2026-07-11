@@ -1,0 +1,22 @@
+{
+  "domains": {
+    "Taxation": ["TAX", "GST", "VAT", "DUTY", "LEVY", "WITHHOLD", "DEDUCT", "STEUER", "MwSt"],
+    "Payments": ["PAY", "TRANSFER", "REMIT", "SETTLE", "CLEAR", "SWIFT", "ACH", "SEPA", "ZAHLUNG"],
+    "Risk Assessment": ["RISK", "SCORE", "CREDIT", "EXPOSURE", "LIMIT", "COLLATERAL"],
+    "Customer Management": ["CUST", "CUSTOMER", "CLIENT", "MEMBER", "KYC"],
+    "Account Management": ["ACCT", "ACCOUNT", "BALANCE", "LEDGER", "DEPOSIT", "WITHDRAW"],
+    "Audit & Compliance": ["AUDIT", "LOG", "TRACE", "COMPLY", "REGULAT"],
+    "Reporting": ["REPORT", "PRINT", "SUMMARY", "EXTRACT"],
+    "Authentication": ["AUTH", "LOGIN", "PASSWORD", "TOKEN", "SESSION"],
+    "Pricing": ["PRICE", "RATE", "FEE", "INTEREST", "PREMIUM", "DISCOUNT"]
+  },
+  "stripPrefixes": ["WS-", "LS-", "GS-", "IX-", "CA-", "LK-", "WK-"],
+  "datasetPrefixes": {
+    "PROD.": "Production",
+    "DEV.": "Development",
+    "SIT.": "System Integration Test",
+    "UAT.": "User Acceptance Test",
+    "DR.": "Disaster Recovery"
+  },
+  "symbolOverrides": {}
+}

@@ -1,42 +1,40 @@
-import { describe, expect, it } from "vitest";
-import { execFileSync } from "child_process";
-import { resolve } from "path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseInitArgv } from "../src/cli/init";
 import { buildLoginUrl } from "../src/cli/github-login";
 
-const CLI_ENTRY = resolve(__dirname, "../src/cli/init.ts");
-
-/**
- * Run `parseInitArgv` in a real child process via tsx so that process.exit
- * actually exits instead of needing mocks.
- */
 function runParseArgv(args: string[]): { code: number; stdout: string; stderr: string } {
-  // Small inline script that imports parseInitArgv, calls it, and prints JSON.
-  const script = `
-    const { parseInitArgv } = require("${CLI_ENTRY.replace(/\\/g, "\\\\")}");
-    try {
-      const result = parseInitArgv(${JSON.stringify(args)});
-      process.stdout.write(JSON.stringify(result));
-    } catch {
-      // parseInitArgv calls process.exit internally — this catch is for safety
-    }
-  `;
-  try {
-    const stdout = execFileSync("npx", ["-y", "tsx", "-e", script], {
-      encoding: "utf-8",
-      timeout: 15_000,
-      env: { ...process.env, NODE_NO_WARNINGS: "1" },
+  let stderr = "";
+  const stderrSpy = vi
+    .spyOn(process.stderr, "write")
+    .mockImplementation((chunk: string | Uint8Array) => {
+      stderr += chunk.toString();
+      return true;
     });
-    return { code: 0, stdout, stderr: "" };
+  const exitSpy = vi
+    .spyOn(process, "exit")
+    .mockImplementation(((code?: string | number | null) => {
+      throw Object.assign(new Error("process.exit"), { code: Number(code ?? 0) });
+    }) as never);
+
+  try {
+    return { code: 0, stdout: JSON.stringify(parseInitArgv(args)), stderr };
   } catch (e: any) {
     return {
-      code: e.status ?? 1,
-      stdout: e.stdout ?? "",
-      stderr: e.stderr ?? "",
+      code: e.code ?? 1,
+      stdout: "",
+      stderr,
     };
+  } finally {
+    exitSpy.mockRestore();
+    stderrSpy.mockRestore();
   }
 }
 
-describe("CLI init — parseInitArgv (real process)", () => {
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("CLI init — parseInitArgv", () => {
   it("parses empty arguments", () => {
     const { code, stdout } = runParseArgv([]);
     expect(code).toBe(0);

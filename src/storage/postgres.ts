@@ -314,7 +314,7 @@ export class PostgresStorage implements Storage {
       await client.query(`
         ALTER TABLE threads ADD COLUMN IF NOT EXISTS participants_hash TEXT;
         CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_participants_hash
-          ON threads(participants_hash, user_id)
+          ON threads(participants_hash, user_id) NULLS NOT DISTINCT
           WHERE participants_hash IS NOT NULL;
       `);
 
@@ -425,7 +425,9 @@ export class PostgresStorage implements Storage {
       const tRes = await client.query<ThreadRow>(
         `INSERT INTO threads (id, participants_hash)
          VALUES ($1, $2)
-         ON CONFLICT (participants_hash, user_id) DO NOTHING
+         ON CONFLICT (participants_hash, user_id)
+           WHERE participants_hash IS NOT NULL
+         DO NOTHING
          RETURNING id, created_at, updated_at`,
         [id, participantsHash]
       );
@@ -1529,6 +1531,21 @@ export class PostgresStorage implements Storage {
 
     const mergeMsg = opts?.message ?? `Merge '${fromBranch}' into '${toBranch}' (${strategy})`;
     return this.createCommit(agentId, mergeMsg, { branch: toBranch });
+  }
+  // ---------- Active Learning Rules ----------
+
+  async upsertLearnedRule(
+    agentId: AgentAddress,
+    rule: import("./interface").LearnedRule
+  ): Promise<void> {
+    throw new Error("Active Learning rules not yet supported on Postgres");
+  }
+
+  async getLearnedRules(
+    agentId: AgentAddress,
+    category?: string
+  ): Promise<import("./interface").LearnedRule[]> {
+    throw new Error("Active Learning rules not yet supported on Postgres");
   }
 }
 

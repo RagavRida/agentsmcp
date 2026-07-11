@@ -34,6 +34,16 @@ export const logger = pino({
   timestamp: pino.stdTimeFunctions.isoTime,
   // Drop pid/hostname defaults - CloudWatch already attaches instance metadata.
   base: undefined,
+  redact: {
+    paths: [
+      "req.headers.authorization",
+      "req.headers.cookie",
+      "req.headers.x-api-key",
+      "headers.authorization",
+      "authorization",
+    ],
+    censor: "[REDACTED]",
+  },
   ...(prettyTransportAvailable()
     ? {
         transport: {

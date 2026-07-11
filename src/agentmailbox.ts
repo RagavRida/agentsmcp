@@ -42,6 +42,10 @@ export class AgentMailbox {
     this.apiKey = config.apiKey;
   }
 
+  getAgentId(): AgentAddress {
+    return this.agentId;
+  }
+
   private headers(): Record<string, string> {
     const h: Record<string, string> = { "Content-Type": "application/json" };
     if (this.apiKey) h["Authorization"] = `Bearer ${this.apiKey}`;
@@ -87,19 +91,21 @@ export class AgentMailbox {
       cc: options.cc,
       bcc: options.bcc,
       replyTo: options.replyTo,
+      handoff: options.handoff,
     });
   }
 
   async replyAll(
     threadId: string,
     payload: unknown,
-    options: { contextSnapshot?: Record<string, unknown> } = {}
+    options: { contextSnapshot?: Record<string, unknown>; handoff?: SendOptions["handoff"] } = {}
   ): Promise<SendResult> {
     return this.request<SendResult>("POST", "/messages/reply-all", {
       from: this.agentId,
       threadId,
       payload,
       contextSnapshot: options.contextSnapshot,
+      handoff: options.handoff,
     });
   }
 
