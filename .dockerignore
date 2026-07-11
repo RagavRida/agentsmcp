@@ -18,6 +18,14 @@ examples
 tests
 scripts/smoke-*.ts
 .DS_Store
+.cognee-ref
+.agentmailbox
+cuda-tutorial
+data
+eval-results
+logs
+infra/modal/__pycache__
+*.pyc
 README.md
 CHANGELOG.md
 RELEASING.md

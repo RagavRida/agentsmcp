@@ -18,6 +18,26 @@ dist/
 # Env
 .env
 .env.local
+**/.env.colima
+infra/colima/certs/
+infra/modal/__pycache__/
+*.pyc
+
+# Local runtime/generated data
+.agentmailbox/
+.cognee-ref/
+cuda-tutorial/
+data/
+eval-results/
+logs/
+
+# Generated parser artifacts
+parser/node_modules/
+parser/dist/
+parser/dist-cjs/
+
+# OS
+**/.DS_Store
 
 # Editor / OS
 .DS_Store
