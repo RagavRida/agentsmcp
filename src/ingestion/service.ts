@@ -24,7 +24,7 @@ export class IngestionService {
         const result = await this.processor.process(file, request.dataset);
         await this.writeManifest(file, checksum, result.program);
         await this.writeDetails(request, file, checksum, result);
-        files.push({ sourceId: file.sourceId, filename: file.filename, status: "indexed", checksum, ...result });
+        files.push({ sourceId: file.sourceId, filename: file.filename, status: "indexed", checksum, program: result.program, rulesExtracted: result.rulesExtracted });
       } catch (error) { files.push({ sourceId: file.sourceId, filename: file.filename, status: "failed", checksum, error: String(error) }); }
     }
     const response = { dataset: request.dataset, connectorRunId: request.connectorRunId, indexed: files.filter((file) => file.status === "indexed").length, skipped: files.filter((file) => file.status === "skipped").length, failed: files.filter((file) => file.status === "failed").length, files };

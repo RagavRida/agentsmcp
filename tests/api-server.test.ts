@@ -205,6 +205,13 @@ describe("AgentMailbox Memory API", () => {
             language: "cobol",
             version: "abc123",
           },
+          {
+            sourceId: "core/LOAN-REPORT.CBL",
+            filename: "LOAN-REPORT.CBL",
+            code: "IDENTIFICATION DIVISION. PROGRAM-ID. LOANRPT.",
+            language: "cobol",
+            version: "abc124",
+          },
         ],
       };
 
@@ -214,7 +221,7 @@ describe("AgentMailbox Memory API", () => {
         body: JSON.stringify(payload),
       });
       expect(first.status).toBe(200);
-      expect(await first.json()).toMatchObject({ indexed: 1, skipped: 0, failed: 0 });
+      expect(await first.json()).toMatchObject({ indexed: 2, skipped: 0, failed: 0 });
 
       const second = await fetch(`${url}/api/v1/ingest`, {
         method: "POST",
@@ -222,23 +229,23 @@ describe("AgentMailbox Memory API", () => {
         body: JSON.stringify(payload),
       });
       expect(second.status).toBe(200);
-      expect(await second.json()).toMatchObject({ indexed: 0, skipped: 1, failed: 0 });
+      expect(await second.json()).toMatchObject({ indexed: 0, skipped: 2, failed: 0 });
 
       const inventory = await fetch(`${url}/api/v1/ingest/inventory`);
       expect(inventory.status).toBe(200);
       expect(await inventory.json()).toMatchObject({
         datasets: ["core-banking"],
-        totalFiles: 1,
-        files: [
-          {
+        totalFiles: 2,
+        files: expect.arrayContaining([
+          expect.objectContaining({
             sourceId: "core/LOAN.CBL",
             filename: "LOAN.CBL",
             status: "skipped",
             dataset: "core-banking",
             program: "LOAN-CBL",
             language: "cobol",
-          },
-        ],
+          }),
+        ]),
       });
 
       const details = await fetch(`${url}/api/v1/ingest/sources/${encodeURIComponent("core/LOAN.CBL")}`);
@@ -253,6 +260,25 @@ describe("AgentMailbox Memory API", () => {
             description: "Calculates monthly interest from balance and rate.",
           },
         ],
+      });
+
+      const impact = await fetch(`${url}/api/v1/impact/analyze?sourceId=${encodeURIComponent("core/LOAN.CBL")}&ruleId=rule-interest`);
+      expect(impact.status).toBe(200);
+      expect(await impact.json()).toMatchObject({
+        target: "rule-interest",
+        affectedDatasets: ["core-banking"],
+        affectedSources: expect.arrayContaining([
+          expect.objectContaining({
+            sourceId: "core/LOAN.CBL",
+            relationship: "selected_source",
+          }),
+        ]),
+        affectedRules: expect.arrayContaining([
+          expect.objectContaining({
+            id: "rule-interest",
+            sourceId: "core/LOAN.CBL",
+          }),
+        ]),
       });
     } finally {
       await rm(root, { recursive: true, force: true });

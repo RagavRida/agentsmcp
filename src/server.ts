@@ -15,8 +15,9 @@ import { validateProductionConfig } from "./config/production";
 import { defaultMetrics } from "./observability/metrics";
 import { buildHandoffContext } from "./handoff/context-builder";
 import { getProductCapabilityMatrix } from "./product/capabilities";
-import { IngestRequestSchema } from "./api/dto";
+import { ImpactAnalyzeRequestSchema, IngestRequestSchema } from "./api/dto";
 import { IngestionService, createMemoryIngestionProcessor } from "./ingestion";
+import { analyzeInventoryImpact } from "./impact/analysis";
 import { getMemory } from "./memory/service";
 import { createStorageAdapterFromEnv } from "./storage/interfaces";
 import { readEnv } from "./env";
@@ -584,6 +585,20 @@ export function createServer(
       });
     }
     return res.status(200).json(details);
+  }));
+
+  app.get("/api/v1/impact/analyze", asyncHandler(async (req: Request, res: Response) => {
+    const parsedQuery = ImpactAnalyzeRequestSchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      return res.status(400).json({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Invalid impact analysis request",
+          details: parsedQuery.error.flatten(),
+        },
+      });
+    }
+    return res.status(200).json(await analyzeInventoryImpact(ingestionService, parsedQuery.data));
   }));
 
   // Cloud-tier rate limiting. Spec: skip entirely when AGENTSMCP_API_KEY is

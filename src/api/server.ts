@@ -9,10 +9,12 @@ import { createStorageAdapterFromEnv } from "../storage/interfaces";
 import { getMemory } from "../memory/service";
 import { checkModelHealth, detectModelConfig } from "../model/provider";
 import { getProductCapabilityMatrix } from "../product/capabilities";
+import { analyzeInventoryImpact } from "../impact/analysis";
 import {
   ErrorResponseSchema,
   ExtractRequestSchema,
   GraphQueryRequestSchema,
+  ImpactAnalyzeRequestSchema,
   IngestRequestSchema,
   type BusinessRuleResult,
   type ExtractRequest,
@@ -157,6 +159,20 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         throw new ApiError(404, "SOURCE_NOT_FOUND", `No indexed source found for ${req.params.sourceId}`);
       }
       res.json(details);
+    }),
+  );
+
+  app.get(
+    "/api/v1/impact/analyze",
+    asyncHandler(async (req, res) => {
+      const parsedQuery = ImpactAnalyzeRequestSchema.safeParse(req.query);
+      if (!parsedQuery.success) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Invalid impact analysis request", parsedQuery.error.flatten());
+      }
+      if (!opts.ingestionService) {
+        throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
+      }
+      res.json(await analyzeInventoryImpact(opts.ingestionService, parsedQuery.data));
     }),
   );
 

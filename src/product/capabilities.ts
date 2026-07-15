@@ -54,11 +54,11 @@ const CAPABILITIES: ProductCapability[] = [
   {
     id: "impact-analysis",
     title: "Impact analysis",
-    status: "prototype",
+    status: "beta",
     category: "analysis",
-    summary: "Dependency graph primitives exist, but the end-to-end change-impact workflow is not product complete yet.",
-    evidence: ["src/graph/neo4j-sync.ts", "src/flare/active-rag.ts", "ui/src/App.tsx"],
-    nextMilestone: "Build a dedicated impact-analysis screen with upstream/downstream evidence and affected job summaries.",
+    summary: "Users can run source and rule-level impact analysis from the repository inventory, with affected files, rules, programs, datasets, and evidence terms.",
+    evidence: ["src/impact/analysis.ts", "src/api/server.ts", "ui/src/App.tsx"],
+    nextMilestone: "Enrich impact results with Neo4j dependency chains and scheduler/runtime telemetry.",
   },
   {
     id: "ai-chat-grounding",

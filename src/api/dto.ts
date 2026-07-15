@@ -151,3 +151,22 @@ export const IngestionSourceDetailsSchema = IngestionInventoryEntrySchema.extend
 }).strict();
 
 export type IngestionSourceDetails = z.infer<typeof IngestionSourceDetailsSchema>;
+
+export const ImpactAnalyzeRequestSchema = z.object({
+  sourceId: OptionalQueryTextSchema,
+  ruleId: OptionalQueryTextSchema,
+  target: OptionalQueryTextSchema,
+  maxResults: QueryIntSchema(25, 1, 100).default(25),
+}).strict().transform((value, ctx) => {
+  if (!value.sourceId && !value.ruleId && !value.target) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "sourceId, ruleId, or target is required",
+      path: ["sourceId"],
+    });
+    return z.NEVER;
+  }
+  return value;
+});
+
+export type ImpactAnalyzeRequest = z.infer<typeof ImpactAnalyzeRequestSchema>;
