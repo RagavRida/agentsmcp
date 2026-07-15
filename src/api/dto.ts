@@ -92,3 +92,23 @@ export const ErrorResponseSchema = z.object({
 }).strict();
 
 export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
+
+export const CapabilityStatusSchema = z.enum(["live", "beta", "prototype", "roadmap"]);
+
+export const ProductCapabilitySchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  status: CapabilityStatusSchema,
+  category: z.enum(["ingestion", "knowledge", "analysis", "ai", "operations", "governance"]),
+  summary: z.string(),
+  evidence: z.array(z.string()),
+  nextMilestone: z.string().optional(),
+}).strict();
+
+export const ProductCapabilityMatrixSchema = z.object({
+  generatedAt: z.string(),
+  statuses: z.record(CapabilityStatusSchema, z.string()),
+  capabilities: z.array(ProductCapabilitySchema),
+}).strict();
+
+export type ProductCapabilityMatrix = z.infer<typeof ProductCapabilityMatrixSchema>;

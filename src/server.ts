@@ -14,6 +14,7 @@ import { assembleContext } from "./context";
 import { validateProductionConfig } from "./config/production";
 import { defaultMetrics } from "./observability/metrics";
 import { buildHandoffContext } from "./handoff/context-builder";
+import { getProductCapabilityMatrix } from "./product/capabilities";
 import { readEnv } from "./env";
 import { logger, createHttpLogger } from "./logger";
 import {
@@ -501,6 +502,10 @@ export function createServer(
       }
     }
   );
+
+  app.get("/api/v1/product/capabilities", (_req: Request, res: Response) => {
+    res.json(getProductCapabilityMatrix());
+  });
 
   const uiDistPath = join(__dirname, "..", "ui", "dist");
   const uiIndexPath = join(uiDistPath, "index.html");

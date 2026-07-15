@@ -191,6 +191,16 @@ describe("HTTP server (auth on)", () => {
     expect((res.data as { ok: boolean }).ok).toBe(true);
   });
 
+  it("allows product capability matrix without auth", async () => {
+    const res = await getJson(`${server.url}/api/v1/product/capabilities`);
+    expect(res.status).toBe(200);
+    const body = res.data as { capabilities: Array<{ id: string; status: string }> };
+    expect(body.capabilities).toContainEqual(expect.objectContaining({
+      id: "mainframe-parser-registry",
+      status: "live",
+    }));
+  });
+
   it("allows requests with the correct Bearer token", async () => {
     const res = await postJson(
       `${server.url}/agents/register`,

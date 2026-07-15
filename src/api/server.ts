@@ -8,6 +8,7 @@ import { IngestionService as SourceIngestionService, createMemoryIngestionProces
 import { createStorageAdapterFromEnv } from "../storage/interfaces";
 import { getMemory } from "../memory/service";
 import { checkModelHealth, detectModelConfig } from "../model/provider";
+import { getProductCapabilityMatrix } from "../product/capabilities";
 import {
   ErrorResponseSchema,
   ExtractRequestSchema,
@@ -92,6 +93,10 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
       openaiCompatible: config.openaiCompatible,
     });
   }));
+
+  app.get("/api/v1/product/capabilities", (_req, res) => {
+    res.json(getProductCapabilityMatrix());
+  });
 
   app.post(
     "/api/v1/extract",

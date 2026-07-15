@@ -166,6 +166,20 @@ describe("AgentMailbox Memory API", () => {
     expect(await response.json()).toMatchObject({ endpoint: "/api/v1/ingest", method: "POST" });
   });
 
+  it("exposes an honest product capability matrix", async () => {
+    const url = await start(createApiApp());
+    const response = await fetch(`${url}/api/v1/product/capabilities`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      capabilities: Array<{ id: string; status: string; evidence: string[] }>;
+    };
+    expect(body.capabilities.some((item) => item.status === "roadmap")).toBe(true);
+    expect(body.capabilities.find((item) => item.id === "mainframe-parser-registry")).toMatchObject({
+      status: "live",
+    });
+    expect(body.capabilities.every((item) => item.evidence.length > 0)).toBe(true);
+  });
+
   async function start(app: ReturnType<typeof createApiApp>): Promise<string> {
     return new Promise((resolve) => {
       server = app.listen(0, "127.0.0.1", () => {
