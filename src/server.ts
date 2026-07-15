@@ -17,6 +17,7 @@ import { buildHandoffContext } from "./handoff/context-builder";
 import { getProductCapabilityMatrix } from "./product/capabilities";
 import { EvidenceExportRequestSchema, ImpactAnalyzeRequestSchema, IngestRequestSchema } from "./api/dto";
 import { IngestionService, createMemoryIngestionProcessor } from "./ingestion";
+import type { TenantScope } from "./ingestion/contracts";
 import { analyzeInventoryImpact } from "./impact/analysis";
 import { createEvidenceBundle } from "./evidence/export";
 import { getMemory } from "./memory/service";
@@ -145,6 +146,25 @@ function getBaseUrl(req: Request): string {
   const fromEnv = readEnv("AGENTSMCP_BASE_URL", "AGENTMAILBOX_BASE_URL");
   if (fromEnv) return fromEnv.replace(/\/$/, "");
   return `${req.protocol}://${req.get("host")}`;
+}
+
+function tenantScopeFromRequest(req: Request): TenantScope {
+  const raw = req.header("x-agentmailbox-tenant") ?? req.header("x-agentsmcp-tenant");
+  const tenantId = raw?.trim();
+  return tenantId ? { tenantId } : {};
+}
+
+function withTenant<T extends { tenantId?: string }>(value: T, scope: TenantScope): T {
+  return scope.tenantId ? { ...value, tenantId: scope.tenantId } : value;
+}
+
+function scopedIngestionProvider(provider: IngestionService, scope: TenantScope) {
+  return {
+    inventory: () => provider.inventory(scope),
+    sourceDetails: (sourceId: string) => provider.sourceDetails(sourceId, scope),
+    recordEvidenceExport: (bundle: Parameters<IngestionService["recordEvidenceExport"]>[0]) =>
+      provider.recordEvidenceExport(bundle),
+  };
 }
 
 const SERVER_SKILLS: AgentCardSkill[] = [
@@ -567,16 +587,16 @@ export function createServer(
         },
       });
     }
-    const result = await ingestionService.ingest(parsedBody.data);
+    const result = await ingestionService.ingest(withTenant(parsedBody.data, tenantScopeFromRequest(req)));
     return res.status(result.failed > 0 ? 207 : 200).json(result);
   }));
 
-  app.get("/api/v1/ingest/inventory", asyncHandler(async (_req: Request, res: Response) => {
-    return res.status(200).json(await ingestionService.inventory());
+  app.get("/api/v1/ingest/inventory", asyncHandler(async (req: Request, res: Response) => {
+    return res.status(200).json(await ingestionService.inventory(tenantScopeFromRequest(req)));
   }));
 
   app.get("/api/v1/ingest/sources/:sourceId", asyncHandler(async (req: Request, res: Response) => {
-    const details = await ingestionService.sourceDetails(req.params.sourceId);
+    const details = await ingestionService.sourceDetails(req.params.sourceId, tenantScopeFromRequest(req));
     if (!details) {
       return res.status(404).json({
         error: {
@@ -599,7 +619,8 @@ export function createServer(
         },
       });
     }
-    return res.status(200).json(await analyzeInventoryImpact(ingestionService, parsedQuery.data));
+    const scope = tenantScopeFromRequest(req);
+    return res.status(200).json(await analyzeInventoryImpact(scopedIngestionProvider(ingestionService, scope), withTenant(parsedQuery.data, scope)));
   }));
 
   app.get("/api/v1/evidence/export", asyncHandler(async (req: Request, res: Response) => {
@@ -613,7 +634,8 @@ export function createServer(
         },
       });
     }
-    const bundle = await createEvidenceBundle(ingestionService, parsedQuery.data, {
+    const scope = tenantScopeFromRequest(req);
+    const bundle = await createEvidenceBundle(scopedIngestionProvider(ingestionService, scope), withTenant(parsedQuery.data, scope), {
       version: getPackageVersion(),
     });
     res.setHeader("Content-Disposition", `attachment; filename="${bundle.metadata.exportId}.json"`);

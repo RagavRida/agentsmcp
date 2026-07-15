@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Memory } from "../memory/api";
 import type { StorageAdapter } from "../storage/interfaces";
-import type { IngestionInventory, IngestionInventoryEntry, IngestionProcessor, IngestionRequest, IngestionResponse, SourceArtifact, IngestionFileResult, IngestionSourceDetails } from "./contracts";
+import type { IngestionInventory, IngestionInventoryEntry, IngestionProcessor, IngestionRequest, IngestionResponse, SourceArtifact, IngestionFileResult, IngestionSourceDetails, TenantScope } from "./contracts";
 import { evidenceAuditRecord, type EvidenceAuditRecord, type EvidenceBundle } from "../evidence/export";
 
 interface IngestionManifest { sourceId: string; checksum: string; version?: string; indexedAt: string; program?: string; }
@@ -19,30 +19,36 @@ export class IngestionService {
 
   async ingest(request: IngestionRequest): Promise<IngestionResponse> {
     const files: IngestionFileResult[] = [];
+    const tenantId = tenantForRequest(request);
     for (const file of request.files) {
       const checksum = checksumFor(file);
-      const previous = await this.readManifest(file.sourceId);
-      if (previous?.checksum === checksum) { files.push({ sourceId: file.sourceId, filename: file.filename, status: "skipped", checksum, program: previous.program }); continue; }
+      const previous = await this.readManifest(file.sourceId, tenantId);
+      if (previous?.checksum === checksum) { files.push({ sourceId: file.sourceId, filename: file.filename, status: "skipped", checksum, tenantId, program: previous.program }); continue; }
       try {
         const result = await this.processor.process(file, request.dataset);
-        await this.writeManifest(file, checksum, result.program);
-        await this.writeDetails(request, file, checksum, result);
-        files.push({ sourceId: file.sourceId, filename: file.filename, status: "indexed", checksum, program: result.program, rulesExtracted: result.rulesExtracted });
-      } catch (error) { files.push({ sourceId: file.sourceId, filename: file.filename, status: "failed", checksum, error: String(error) }); }
+        await this.writeManifest(file, checksum, result.program, tenantId);
+        await this.writeDetails(request, file, checksum, result, tenantId);
+        files.push({ sourceId: file.sourceId, filename: file.filename, status: "indexed", checksum, tenantId, program: result.program, rulesExtracted: result.rulesExtracted });
+      } catch (error) { files.push({ sourceId: file.sourceId, filename: file.filename, status: "failed", checksum, tenantId, error: String(error) }); }
     }
     const response = { dataset: request.dataset, connectorRunId: request.connectorRunId, indexed: files.filter((file) => file.status === "indexed").length, skipped: files.filter((file) => file.status === "skipped").length, failed: files.filter((file) => file.status === "failed").length, files };
     await this.updateInventory(request, files);
     return response;
   }
 
-  async inventory(): Promise<IngestionInventory> {
-    return this.readInventory();
+  async inventory(scope: TenantScope = {}): Promise<IngestionInventory> {
+    const inventory = await this.readInventory();
+    return scope.tenantId ? summarizeInventory(inventory.files.filter((file) => file.tenantId === scope.tenantId)) : inventory;
   }
 
-  async sourceDetails(sourceId: string): Promise<IngestionSourceDetails | null> {
-    const raw = await this.storage.read(this.detailsKey(sourceId));
+  async sourceDetails(sourceId: string, scope: TenantScope = {}): Promise<IngestionSourceDetails | null> {
+    const raw = await this.storage.read(this.detailsKey(sourceId, scope.tenantId));
     if (!raw) return null;
-    try { return JSON.parse(raw.toString("utf8")) as IngestionSourceDetails; } catch { return null; }
+    try {
+      const details = JSON.parse(raw.toString("utf8")) as IngestionSourceDetails;
+      if (scope.tenantId && details.tenantId !== scope.tenantId) return null;
+      return details;
+    } catch { return null; }
   }
 
   async recordEvidenceExport(bundle: EvidenceBundle): Promise<void> {
@@ -53,16 +59,17 @@ export class IngestionService {
     await this.storage.write(this.evidenceAuditKey, JSON.stringify(next, null, 2));
   }
 
-  private manifestKey(sourceId: string): string { return `${this.prefix}/${createHash("sha256").update(sourceId).digest("hex")}.json`; }
-  private detailsKey(sourceId: string): string { return `${this.detailsPrefix}/${createHash("sha256").update(sourceId).digest("hex")}.json`; }
-  private async readManifest(sourceId: string): Promise<IngestionManifest | null> { const raw = await this.storage.read(this.manifestKey(sourceId)); if (!raw) return null; try { return JSON.parse(raw.toString("utf8")) as IngestionManifest; } catch { return null; } }
-  private async writeManifest(file: SourceArtifact, checksum: string, program: string): Promise<void> { await this.storage.write(this.manifestKey(file.sourceId), JSON.stringify({ sourceId: file.sourceId, checksum, version: file.version, indexedAt: new Date().toISOString(), program } satisfies IngestionManifest, null, 2)); }
-  private async writeDetails(request: IngestionRequest, file: SourceArtifact, checksum: string, result: Awaited<ReturnType<IngestionProcessor["process"]>>): Promise<void> {
+  private manifestKey(sourceId: string, tenantId?: string): string { return `${this.prefix}/${createHash("sha256").update(storageIdentity(sourceId, tenantId)).digest("hex")}.json`; }
+  private detailsKey(sourceId: string, tenantId?: string): string { return `${this.detailsPrefix}/${createHash("sha256").update(storageIdentity(sourceId, tenantId)).digest("hex")}.json`; }
+  private async readManifest(sourceId: string, tenantId?: string): Promise<IngestionManifest | null> { const raw = await this.storage.read(this.manifestKey(sourceId, tenantId)); if (!raw) return null; try { return JSON.parse(raw.toString("utf8")) as IngestionManifest; } catch { return null; } }
+  private async writeManifest(file: SourceArtifact, checksum: string, program: string, tenantId?: string): Promise<void> { await this.storage.write(this.manifestKey(file.sourceId, tenantId), JSON.stringify({ sourceId: file.sourceId, checksum, version: file.version, indexedAt: new Date().toISOString(), program } satisfies IngestionManifest, null, 2)); }
+  private async writeDetails(request: IngestionRequest, file: SourceArtifact, checksum: string, result: Awaited<ReturnType<IngestionProcessor["process"]>>, tenantId?: string): Promise<void> {
     const details: IngestionSourceDetails = {
       sourceId: file.sourceId,
       filename: file.filename,
       status: "indexed",
       checksum,
+      tenantId,
       dataset: request.dataset,
       connectorRunId: request.connectorRunId,
       language: file.language,
@@ -72,18 +79,21 @@ export class IngestionService {
       rulesExtracted: result.rulesExtracted,
       businessRules: result.businessRules ?? [],
     };
-    await this.storage.write(this.detailsKey(file.sourceId), JSON.stringify(details, null, 2));
+    await this.storage.write(this.detailsKey(file.sourceId, tenantId), JSON.stringify(details, null, 2));
   }
   private async readInventory(): Promise<IngestionInventory> { const raw = await this.storage.read(this.inventoryKey); if (!raw) return emptyInventory(); try { return normalizeInventory(JSON.parse(raw.toString("utf8"))); } catch { return emptyInventory(); } }
   private async updateInventory(request: IngestionRequest, files: IngestionFileResult[]): Promise<void> {
     const inventory = await this.readInventory();
-    const bySource = new Map(inventory.files.map((file) => [file.sourceId, file]));
+    const bySource = new Map(inventory.files.map((file) => [inventoryKeyFor(file.sourceId, file.tenantId), file]));
     const now = new Date().toISOString();
+    const tenantId = tenantForRequest(request);
     for (const result of files) {
       const source = request.files.find((file) => file.sourceId === result.sourceId);
-      bySource.set(result.sourceId, {
-        ...bySource.get(result.sourceId),
+      const key = inventoryKeyFor(result.sourceId, tenantId);
+      bySource.set(key, {
+        ...bySource.get(key),
         ...result,
+        tenantId,
         dataset: request.dataset,
         connectorRunId: request.connectorRunId,
         language: source?.language,
@@ -113,6 +123,18 @@ function summarizeInventory(files: IngestionInventoryEntry[]): IngestionInventor
     failed: sorted.filter((file) => file.status === "failed").length,
     files: sorted,
   };
+}
+
+function tenantForRequest(request: IngestionRequest): string | undefined {
+  return request.tenantId ?? request.files.find((file) => file.tenantId)?.tenantId;
+}
+
+function storageIdentity(sourceId: string, tenantId?: string): string {
+  return tenantId ? `${tenantId}\0${sourceId}` : sourceId;
+}
+
+function inventoryKeyFor(sourceId: string, tenantId?: string): string {
+  return storageIdentity(sourceId, tenantId);
 }
 
 function safeParseAudit(raw: Buffer): EvidenceAuditRecord[] {

@@ -5,6 +5,7 @@ import { ZodError } from "zod";
 import { parseCobol, type ParseCobolResult, type SemanticNodeCompact } from "../parser";
 import type { SearchResult } from "../vector/store";
 import { IngestionService as SourceIngestionService, createMemoryIngestionProcessor } from "../ingestion";
+import type { TenantScope } from "../ingestion/contracts";
 import { createStorageAdapterFromEnv } from "../storage/interfaces";
 import { getMemory } from "../memory/service";
 import { checkModelHealth, detectModelConfig } from "../model/provider";
@@ -130,7 +131,7 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
       if (!opts.ingestionService) {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
-      const result = await opts.ingestionService.ingest(parsedBody.data);
+      const result = await opts.ingestionService.ingest(withTenant(parsedBody.data, tenantScopeFromRequest(req)));
       res.status(result.failed > 0 ? 207 : 200).json(result);
     }),
   );
@@ -146,11 +147,11 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
 
   app.get(
     "/api/v1/ingest/inventory",
-    asyncHandler(async (_req, res) => {
+    asyncHandler(async (req, res) => {
       if (!opts.ingestionService) {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
-      res.json(await opts.ingestionService.inventory());
+      res.json(await opts.ingestionService.inventory(tenantScopeFromRequest(req)));
     }),
   );
 
@@ -160,7 +161,7 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
       if (!opts.ingestionService) {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
-      const details = await opts.ingestionService.sourceDetails(req.params.sourceId);
+      const details = await opts.ingestionService.sourceDetails(req.params.sourceId, tenantScopeFromRequest(req));
       if (!details) {
         throw new ApiError(404, "SOURCE_NOT_FOUND", `No indexed source found for ${req.params.sourceId}`);
       }
@@ -178,7 +179,7 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
       if (!opts.ingestionService) {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
-      res.json(await analyzeInventoryImpact(opts.ingestionService, parsedQuery.data));
+      res.json(await analyzeInventoryImpact(scopedIngestionProvider(opts.ingestionService, tenantScopeFromRequest(req)), withTenant(parsedQuery.data, tenantScopeFromRequest(req))));
     }),
   );
 
@@ -192,7 +193,8 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
       if (!opts.ingestionService) {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
-      const bundle = await createEvidenceBundle(opts.ingestionService, parsedQuery.data, {
+      const scope = tenantScopeFromRequest(req);
+      const bundle = await createEvidenceBundle(scopedIngestionProvider(opts.ingestionService, scope), withTenant(parsedQuery.data, scope), {
         version: process.env.npm_package_version,
       });
       res.setHeader("Content-Disposition", `attachment; filename="${bundle.metadata.exportId}.json"`);
@@ -208,7 +210,7 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         throw new ApiError(400, "VALIDATION_ERROR", "Invalid graph search request", parsedQuery.error.flatten());
       }
 
-      const search = parsedQuery.data;
+      const search = withTenant(parsedQuery.data, tenantScopeFromRequest(req));
       const response = await runGraphSearch(search, {
         graphSearchProvider: opts.graphSearchProvider,
         vectorStore: opts.vectorStore,
@@ -226,7 +228,7 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         throw new ApiError(400, "VALIDATION_ERROR", "Invalid grounded chat request", parsedBody.error.flatten());
       }
 
-      res.json(await runGroundedChat(parsedBody.data, {
+      res.json(await runGroundedChat(withTenant(parsedBody.data, tenantScopeFromRequest(req)), {
         graphSearchProvider: opts.graphSearchProvider,
         vectorStore: opts.vectorStore,
         localRules,
@@ -259,6 +261,29 @@ function resolveWebAppPaths(): { root: string; indexHtml: string } | null {
   return fs.existsSync(indexHtml) ? { root, indexHtml } : null;
 }
 
+function tenantScopeFromRequest(req: Request): TenantScope {
+  const raw = req.header("x-agentmailbox-tenant") ?? req.header("x-agentsmcp-tenant");
+  const tenantId = raw?.trim();
+  return tenantId ? { tenantId } : {};
+}
+
+function withTenant<T extends { tenantId?: string }>(value: T, scope: TenantScope): T {
+  return scope.tenantId ? { ...value, tenantId: scope.tenantId } : value;
+}
+
+function scopedIngestionProvider<T extends Pick<SourceIngestionService, "inventory" | "sourceDetails"> & Partial<Pick<SourceIngestionService, "recordEvidenceExport">>>(
+  provider: T,
+  scope: TenantScope,
+) {
+  return {
+    inventory: () => provider.inventory(scope),
+    sourceDetails: (sourceId: string) => provider.sourceDetails(sourceId, scope),
+    recordEvidenceExport: provider.recordEvidenceExport
+      ? (bundle: Parameters<NonNullable<T["recordEvidenceExport"]>>[0]) => provider.recordEvidenceExport!(bundle)
+      : undefined,
+  };
+}
+
 export function createApiServer(options: ApiServerOptions = {}): express.Express {
   return createApiApp(options);
 }
@@ -284,11 +309,12 @@ async function runGraphSearch(
 ) {
   if (opts.graphSearchProvider) {
     const results = await opts.graphSearchProvider.search(request);
+    const scoped = filterRulesByTenant(results, request.tenantId);
     return {
       query: request.query,
-      count: results.length,
+      count: scoped.length,
       source: "graph-search-provider",
-      results,
+      results: scoped,
     };
   }
 
@@ -298,7 +324,7 @@ async function runGraphSearch(
       domain: request.domain,
       program: request.program,
     });
-    const mapped = results.map(vectorResultToBusinessRule);
+    const mapped = filterRulesByTenant(results.map(vectorResultToBusinessRule), request.tenantId);
     return {
       query: request.query,
       count: mapped.length,
@@ -307,13 +333,18 @@ async function runGraphSearch(
     };
   }
 
-  const results = opts.localRules.search(request);
+  const results = filterRulesByTenant(opts.localRules.search(request), request.tenantId);
   return {
     query: request.query,
     count: results.length,
     source: "local-extract-cache",
     results,
   };
+}
+
+function filterRulesByTenant(results: BusinessRuleResult[], tenantId?: string): BusinessRuleResult[] {
+  if (!tenantId) return results;
+  return results.filter((result) => result.metadata?.tenantId === tenantId);
 }
 
 async function runGroundedChat(
@@ -326,6 +357,7 @@ async function runGroundedChat(
 ): Promise<GroundedChatResponse> {
   const search = await runGraphSearch({
     query: request.query,
+    tenantId: request.tenantId,
     limit: request.limit,
     program: request.program,
     domain: request.domain,

@@ -65,9 +65,9 @@ const CAPABILITIES: ProductCapability[] = [
     title: "Grounded AI chat",
     status: "beta",
     category: "ai",
-    summary: "Chat answers are generated from retrieved business-rule evidence and return citations, confidence, source IDs, or a no-grounding refusal.",
+    summary: "Chat answers are generated from tenant-scoped business-rule evidence and return citations, confidence, source IDs, or a no-grounding refusal.",
     evidence: ["src/api/server.ts", "src/api/dto.ts", "ui/src/App.tsx", "tests/api-server.test.ts"],
-    nextMilestone: "Add LLM narrative generation constrained to cited snippets and tenant-scoped source permissions.",
+    nextMilestone: "Add LLM narrative generation constrained to cited snippets and tenant-scoped model prompts.",
   },
   {
     id: "agent-context-handoff",

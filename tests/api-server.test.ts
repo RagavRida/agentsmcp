@@ -113,6 +113,7 @@ describe("AgentMailbox Memory API", () => {
     expect(body.results[0].id).toBe("external-rule");
     expect(graphSearchProvider.search).toHaveBeenCalledWith({
       query: "batch",
+      tenantId: undefined,
       limit: 10,
       program: "PAY-BATCH",
       domain: undefined,
@@ -180,6 +181,47 @@ describe("AgentMailbox Memory API", () => {
       unansweredReason: "NO_GROUNDED_EVIDENCE",
     });
     expect(body.answer).toContain("I do not have grounded source evidence");
+  });
+
+  it("filters graph search and grounded chat by tenant", async () => {
+    const graphSearchProvider = {
+      search: vi.fn(async () => [
+        {
+          id: "tenant-a-rule",
+          program: "A-PROG",
+          type: "BUSINESS_RULE",
+          description: "Tenant A interest rule",
+          metadata: { tenantId: "tenant-a", sourceId: "a/LOAN.CBL" },
+        },
+        {
+          id: "tenant-b-rule",
+          program: "B-PROG",
+          type: "BUSINESS_RULE",
+          description: "Tenant B interest rule",
+          metadata: { tenantId: "tenant-b", sourceId: "b/LOAN.CBL" },
+        },
+      ]),
+    };
+    const url = await start(createApiApp({ graphSearchProvider }));
+
+    const search = await fetch(`${url}/api/v1/graph/search?query=interest`, {
+      headers: { "X-AgentMailbox-Tenant": "tenant-a" },
+    });
+    expect(search.status).toBe(200);
+    const searchBody = await search.json();
+    expect(searchBody.results).toHaveLength(1);
+    expect(searchBody.results[0].id).toBe("tenant-a-rule");
+
+    const chat = await fetch(`${url}/api/v1/chat/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-AgentMailbox-Tenant": "tenant-b" },
+      body: JSON.stringify({ query: "interest" }),
+    });
+    expect(chat.status).toBe(200);
+    const chatBody = await chat.json();
+    expect(chatBody.citations).toHaveLength(1);
+    expect(chatBody.citations[0].id).toBe("tenant-b-rule");
+    expect(chatBody.answer).toContain("Tenant B interest rule");
   });
 
   it("returns structured validation errors", async () => {
@@ -375,6 +417,77 @@ describe("AgentMailbox Memory API", () => {
         ruleId: "rule-interest",
         contentHash: bundle.metadata.contentHash,
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("scopes ingestion inventory, details, impact, and evidence by tenant", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmailbox-tenant-"));
+    try {
+      const ingestionService = new IngestionService({
+        manifestStorage: new LocalStorageAdapter(root),
+        processor: {
+          async process(file) {
+            return {
+              program: file.filename.replace(/\W+/g, "-").toUpperCase(),
+              rulesExtracted: 1,
+              businessRules: [
+                {
+                  id: `rule-${file.filename}`,
+                  type: "BUSINESS_RULE",
+                  description: `Rule for ${file.filename}`,
+                },
+              ],
+            };
+          },
+        },
+      });
+      const url = await start(createApiApp({ ingestionService }));
+      const payload = (filename: string) => ({
+        dataset: "core",
+        files: [{ sourceId: "shared/LOAN.CBL", filename, code: `IDENTIFICATION DIVISION. PROGRAM-ID. ${filename}.`, language: "cobol" }],
+      });
+
+      await fetch(`${url}/api/v1/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-AgentMailbox-Tenant": "tenant-a" },
+        body: JSON.stringify(payload("A-LOAN.CBL")),
+      });
+      await fetch(`${url}/api/v1/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-AgentMailbox-Tenant": "tenant-b" },
+        body: JSON.stringify(payload("B-LOAN.CBL")),
+      });
+
+      const inventoryA = await fetch(`${url}/api/v1/ingest/inventory`, {
+        headers: { "X-AgentMailbox-Tenant": "tenant-a" },
+      });
+      expect(await inventoryA.json()).toMatchObject({
+        totalFiles: 1,
+        files: [expect.objectContaining({ filename: "A-LOAN.CBL", tenantId: "tenant-a" })],
+      });
+
+      const detailsA = await fetch(`${url}/api/v1/ingest/sources/${encodeURIComponent("shared/LOAN.CBL")}`, {
+        headers: { "X-AgentMailbox-Tenant": "tenant-a" },
+      });
+      expect(detailsA.status).toBe(200);
+      expect(await detailsA.json()).toMatchObject({ filename: "A-LOAN.CBL", tenantId: "tenant-a" });
+
+      const impactB = await fetch(`${url}/api/v1/impact/analyze?sourceId=${encodeURIComponent("shared/LOAN.CBL")}`, {
+        headers: { "X-AgentMailbox-Tenant": "tenant-b" },
+      });
+      expect(await impactB.json()).toMatchObject({
+        affectedSources: [expect.objectContaining({ filename: "B-LOAN.CBL" })],
+      });
+
+      const evidenceA = await fetch(`${url}/api/v1/evidence/export?sourceId=${encodeURIComponent("shared/LOAN.CBL")}`, {
+        headers: { "X-AgentMailbox-Tenant": "tenant-a" },
+      });
+      expect(evidenceA.status).toBe(200);
+      const bundle = await evidenceA.json();
+      expect(bundle.metadata.request.tenantId).toBe("tenant-a");
+      expect(bundle.source.filename).toBe("A-LOAN.CBL");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

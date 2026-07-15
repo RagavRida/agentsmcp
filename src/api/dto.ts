@@ -2,10 +2,11 @@ import { z } from "zod";
 
 export const IngestRequestSchema = z.object({
   dataset: z.string().min(1).max(256),
+  tenantId: z.string().min(1).max(256).optional(),
   connectorRunId: z.string().max(256).optional(),
   files: z.array(z.object({
     sourceId: z.string().min(1).max(512), filename: z.string().min(1).max(512), code: z.string().min(1).max(10_000_000),
-    language: z.enum(["auto", "cobol", "jcl", "pli", "rexx", "unknown"]).optional(), dataset: z.string().min(1).max(256).optional(), version: z.string().max(256).optional(), encoding: z.string().max(64).optional(), metadata: z.record(z.string()).optional(), copybooks: z.record(z.string()).optional(),
+    tenantId: z.string().min(1).max(256).optional(), language: z.enum(["auto", "cobol", "jcl", "pli", "rexx", "unknown"]).optional(), dataset: z.string().min(1).max(256).optional(), version: z.string().max(256).optional(), encoding: z.string().max(64).optional(), metadata: z.record(z.string()).optional(), copybooks: z.record(z.string()).optional(),
   }).strict()).min(1).max(500),
 }).strict();
 
@@ -39,6 +40,7 @@ const QueryIntSchema = (def: number, min: number, max: number) =>
 export const GraphQueryRequestSchema = z.object({
   q: OptionalQueryTextSchema,
   query: OptionalQueryTextSchema,
+  tenantId: OptionalQueryTextSchema,
   limit: QueryIntSchema(10, 1, 100).default(10),
   program: OptionalQueryTextSchema,
   domain: OptionalQueryTextSchema,
@@ -54,6 +56,7 @@ export const GraphQueryRequestSchema = z.object({
   }
   return {
     query,
+    tenantId: value.tenantId,
     limit: value.limit,
     program: value.program,
     domain: value.domain,
@@ -85,6 +88,7 @@ export type GraphSearchResponse = z.infer<typeof GraphSearchResponseSchema>;
 
 export const GroundedChatRequestSchema = z.object({
   query: z.string().min(1).max(4_000),
+  tenantId: z.string().min(1).max(256).optional(),
   limit: z.number().int().min(1).max(20).optional().default(6),
   program: z.string().min(1).optional(),
   domain: z.string().min(1).optional(),
@@ -150,6 +154,7 @@ export const IngestionInventoryEntrySchema = z.object({
   filename: z.string(),
   status: z.enum(["indexed", "skipped", "failed"]),
   checksum: z.string(),
+  tenantId: z.string().optional(),
   dataset: z.string(),
   connectorRunId: z.string().optional(),
   language: z.enum(["auto", "cobol", "jcl", "pli", "rexx", "unknown"]).optional(),
@@ -188,6 +193,7 @@ export const ImpactAnalyzeRequestSchema = z.object({
   sourceId: OptionalQueryTextSchema,
   ruleId: OptionalQueryTextSchema,
   target: OptionalQueryTextSchema,
+  tenantId: OptionalQueryTextSchema,
   maxResults: QueryIntSchema(25, 1, 100).default(25),
 }).strict().transform((value, ctx) => {
   if (!value.sourceId && !value.ruleId && !value.target) {

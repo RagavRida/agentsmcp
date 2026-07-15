@@ -31,7 +31,7 @@ type IngestionInventory = {
   indexed: number;
   skipped: number;
   failed: number;
-  files: Array<{ sourceId: string; filename: string; status: "indexed" | "skipped" | "failed"; dataset?: string; connector?: string; language?: string; program?: string; error?: string; lastSeenAt?: string }>;
+  files: Array<{ sourceId: string; filename: string; status: "indexed" | "skipped" | "failed"; tenantId?: string; dataset?: string; connector?: string; language?: string; program?: string; error?: string; lastSeenAt?: string }>;
 };
 type IngestionSourceDetails = IngestionInventory["files"][number] & {
   rulesExtracted?: number;
@@ -91,7 +91,7 @@ const fallbackCapabilityMatrix: ProductCapabilityMatrix = {
     { id: "knowledge-graph-memory", title: "Knowledge graph and memory layer", status: "beta", category: "knowledge", summary: "Stores program knowledge across graph, vector, RAPTOR-style tree, and mailbox context surfaces.", evidence: ["src/graph/neo4j-sync.ts", "src/vector/store.ts", "src/raptor/tree-store.ts"], nextMilestone: "Persist graph and vector indexes through the production ingestion workflow by default." },
     { id: "repository-ingestion", title: "Mainframe repository ingestion", status: "beta", category: "ingestion", summary: "Accepts versioned source batches through the ingestion API and records ingestion manifests.", evidence: ["src/ingestion/service.ts", "src/api/server.ts", "tests/integration/memory.test.ts"], nextMilestone: "Add first-class ZIP, mounted folder, Git, and SFTP connector flows in the UI." },
     { id: "impact-analysis", title: "Impact analysis", status: "beta", category: "analysis", summary: "Users can run source and rule-level impact analysis from the repository inventory, with affected files, rules, programs, datasets, and evidence terms.", evidence: ["src/impact/analysis.ts", "src/api/server.ts", "ui/src/App.tsx"], nextMilestone: "Enrich impact results with Neo4j dependency chains and scheduler/runtime telemetry." },
-    { id: "ai-chat-grounding", title: "Grounded AI chat", status: "beta", category: "ai", summary: "Chat answers are generated from retrieved business-rule evidence and return citations, confidence, source IDs, or a no-grounding refusal.", evidence: ["src/api/server.ts", "src/api/dto.ts", "ui/src/App.tsx", "tests/api-server.test.ts"], nextMilestone: "Add LLM narrative generation constrained to cited snippets and tenant-scoped source permissions." },
+    { id: "ai-chat-grounding", title: "Grounded AI chat", status: "beta", category: "ai", summary: "Chat answers are generated from tenant-scoped business-rule evidence and return citations, confidence, source IDs, or a no-grounding refusal.", evidence: ["src/api/server.ts", "src/api/dto.ts", "ui/src/App.tsx", "tests/api-server.test.ts"], nextMilestone: "Add LLM narrative generation constrained to cited snippets and tenant-scoped model prompts." },
     { id: "agent-context-handoff", title: "Focused agent context handoff", status: "live", category: "ai", summary: "Builds compact task-specific handoff packets so one agent receives only the context needed for the next task.", evidence: ["src/handoff/context-builder.ts", "tests/handoff.test.ts"] },
     { id: "production-onprem-stack", title: "On-prem production stack", status: "beta", category: "operations", summary: "Runs with PostgreSQL, Neo4j, MinIO, HTTPS proxy, local Colima support, and Modal/on-prem model endpoints.", evidence: ["infra/colima/docker-compose.colima.yml", "infra/docker/docker-compose.onprem.yml", "infra/modal/modal_vllm.py"], nextMilestone: "Add production Modal endpoint authentication and remove remaining dependency audit findings." },
     { id: "audit-compliance-exports", title: "Audit and compliance exports", status: "beta", category: "governance", summary: "Exports source-linked JSON evidence bundles with inventory metadata, extracted rules, impact analysis, capability status, hashes, and persisted audit records.", evidence: ["src/evidence/export.ts", "src/ingestion/service.ts", "tests/api-server.test.ts"], nextMilestone: "Add signed PDF/Markdown evidence packs and tenant-scoped audit history search." },
@@ -112,6 +112,7 @@ function App() {
   const [capabilityMatrix, setCapabilityMatrix] = useState<ProductCapabilityMatrix>(fallbackCapabilityMatrix);
   const [inventory, setInventory] = useState<IngestionInventory | null>(null);
   const [apiKey, setApiKey] = useState(() => window.localStorage.getItem("agentmailbox.apiKey") ?? "");
+  const [tenantId, setTenantId] = useState(() => window.localStorage.getItem("agentmailbox.tenantId") ?? "");
   const [selectedFiles, setSelectedFiles] = useState<UploadFile[]>([]);
   const [sourceDetails, setSourceDetails] = useState<IngestionSourceDetails | null>(null);
   const [detailsStatus, setDetailsStatus] = useState("");
@@ -146,7 +147,7 @@ function App() {
   async function refreshInventory() {
     try {
       const response = await fetch(`${API_BASE}/api/v1/ingest/inventory`, {
-        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        headers: requestHeaders(),
       });
       if (!response.ok) return;
       setInventory(await response.json());
@@ -168,7 +169,7 @@ function App() {
     try {
       const response = await fetch(`${API_BASE}/api/v1/chat/answer`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requestHeaders(true),
         body: JSON.stringify({ query: cleanQuery, limit: 6 }),
       });
       const payload = await response.json();
@@ -206,6 +207,7 @@ function App() {
     setImportStatus("Ingesting source batch...");
     try {
       if (apiKey) window.localStorage.setItem("agentmailbox.apiKey", apiKey);
+      if (tenantId) window.localStorage.setItem("agentmailbox.tenantId", tenantId);
       const uploadedFiles = await Promise.all(selectedFiles.map(async (file) => {
         const sourcePath = file.webkitRelativePath || file.name;
         return {
@@ -222,10 +224,7 @@ function App() {
       }
       const response = await fetch(`${API_BASE}/api/v1/ingest`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-        },
+        headers: requestHeaders(true),
         body: JSON.stringify({
           dataset,
           connectorRunId: `ui-${Date.now()}`,
@@ -251,7 +250,7 @@ function App() {
     setDetailsStatus("Loading source details...");
     try {
       const response = await fetch(`${API_BASE}/api/v1/ingest/sources/${encodeURIComponent(sourceId)}`, {
-        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        headers: requestHeaders(),
       });
       if (!response.ok) throw new Error("Source details unavailable");
       setSourceDetails(await response.json());
@@ -270,7 +269,7 @@ function App() {
       const params = new URLSearchParams({ sourceId, maxResults: "20" });
       if (ruleId) params.set("ruleId", ruleId);
       const response = await fetch(`${API_BASE}/api/v1/impact/analyze?${params.toString()}`, {
-        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        headers: requestHeaders(),
       });
       if (!response.ok) throw new Error("Impact analysis failed");
       setImpactResult(await response.json());
@@ -288,7 +287,7 @@ function App() {
       const params = new URLSearchParams({ sourceId, maxResults: "20" });
       if (ruleId) params.set("ruleId", ruleId);
       const response = await fetch(`${API_BASE}/api/v1/evidence/export?${params.toString()}`, {
-        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        headers: requestHeaders(),
       });
       if (!response.ok) throw new Error("Evidence export failed");
       const bundle = await response.json();
@@ -335,8 +334,16 @@ function App() {
         <section className="graph-column"><div className="graph-header"><div><div className="eyebrow">{view === "settings" ? "Product truth" : view === "programs" ? "Repository inventory" : "Dependency map"}</div><h2>{view === "settings" ? "Capability matrix" : view === "programs" ? "Programs inventory" : "Claims processing workflow"}</h2><span className="graph-meta"><Activity size={13} /> {view === "settings" ? "Live product status labels" : view === "programs" ? "Indexed source estate" : "Live relationship view · updated just now"}</span></div><div className="graph-header-actions"><button className="icon-button" aria-label="Graph options"><MoreHorizontal size={18} /></button></div></div>{view === "settings" ? <CapabilityMatrix matrix={capabilityMatrix} counts={capabilityCounts} /> : view === "programs" ? <ProgramInventory inventory={inventory} details={sourceDetails} detailsStatus={detailsStatus} impact={impactResult} impactStatus={impactStatus} evidence={evidenceBundle} evidenceStatus={evidenceStatus} onImport={() => setImportOpen(true)} onSelectSource={openSourceDetails} onAnalyzeImpact={analyzeImpact} onExportEvidence={exportEvidence} /> : <><div className="graph-toolbar"><div className="segmented" role="tablist">{(["Graph", "Flow", "Files"] as GraphMode[]).map((mode) => <button key={mode} className={graphMode === mode ? "is-active" : ""} onClick={() => setGraphMode(mode)} role="tab" aria-selected={graphMode === mode}>{mode}</button>)}</div><div className="graph-tools"><button className="icon-button" aria-label="Zoom in" onClick={() => setScale((current) => Math.min(1.35, current + .1))}><Plus size={16} /></button><button className="icon-button" aria-label="Zoom out" onClick={() => setScale((current) => Math.max(.75, current - .1))}><Minus size={16} /></button><button className="icon-button" aria-label="Fit graph" onClick={() => setScale(1)}><Maximize2 size={15} /></button></div></div><div className="graph-canvas"><svg viewBox="0 0 760 620" role="img" aria-label="Interactive business dependency graph"><g transform={`scale(${scale})`}>{edges.map(([from, to]) => { const a = nodes.find((node) => node.id === from)!; const b = nodes.find((node) => node.id === to)!; return <line key={`${from}-${to}`} className={connectedIds.has(from) && connectedIds.has(to) ? "graph-line is-connected" : "graph-line"} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />; })}{nodes.map((node) => <g key={node.id} className={`graph-node ${node.id === selectedId ? "is-selected" : ""}`} transform={`translate(${node.x} ${node.y})`} onClick={() => setSelectedId(node.id)} tabIndex={0} role="button" aria-label={`Select ${node.label}`}><circle r={node.id === selectedId ? 9 : 5} /><text x="13" y="4">{node.label}</text></g>)}</g></svg><div className="graph-legend"><span><i className="legend-dot green" /> Selected path</span><span><i className="legend-dot gray" /> Related entity</span></div><div className="graph-zoom">{Math.round(scale * 100)}%</div></div><aside className="node-inspector"><div className="inspector-heading"><span className="eyebrow">Selected entity</span><button className="icon-button" aria-label="Close inspector"><X size={15} /></button></div><div className="inspector-title"><span className="selected-dot" /><strong>{selected.label}</strong></div><p>{selected.description}</p><div className="inspector-grid"><div><span>Type</span><strong>{selected.type}</strong></div><div><span>Program</span><strong>{selected.program}</strong></div><div><span>Connections</span><strong>{connectedIds.size - 1} related</strong></div></div><button className="dark-button" onClick={() => { setQuery(`Explain ${selected.label}`); setView("chat"); }}>Open explanation <ArrowUp size={15} /></button></aside></>}</section>
       </section>
     </main>
-    {importOpen && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><form onSubmit={extract}><div className="modal-header"><div><div className="eyebrow">Add to knowledge layer</div><h2 id="import-title">Import mainframe source</h2><p>Ingest source files into a versioned repository inventory.</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)} aria-label="Close import dialog"><X size={18} /></button></div><label>API key<input name="apiKey" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="Bearer key for this deployment" /></label><label>Dataset<input name="dataset" defaultValue="local-upload" required /></label><label>Repository files<input className="file-picker" type="file" multiple onChange={selectImportFiles} /></label>{selectedFiles.length > 0 && <div className="file-selection"><strong>{selectedFiles.length} files selected</strong><span>{selectedFiles.slice(0, 3).map((file) => file.webkitRelativePath || file.name).join(", ")}{selectedFiles.length > 3 ? "..." : ""}</span></div>}<label>Fallback filename<input name="filename" defaultValue="LOAN-CALC.cbl" required={selectedFiles.length === 0} /></label><label>Paste source<textarea name="code" rows={10} placeholder="Paste COBOL, JCL, PL/I, or REXX source when not selecting files..." required={selectedFiles.length === 0} /></label>{inventory && <div className="inventory-strip"><span>{inventory.totalFiles} files</span><span>{inventory.indexed} indexed</span><span>{inventory.failed} failed</span></div>}{importStatus && <div className={`modal-status ${importStatus.startsWith("The") ? "is-error" : ""}`}>{importStatus}</div>}<div className="modal-actions"><button type="button" className="outline-button" onClick={() => setImportOpen(false)}>Cancel</button><button className="dark-button" type="submit">Ingest source <ArrowUp size={15} /></button></div></form></div></div>}
+    {importOpen && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><form onSubmit={extract}><div className="modal-header"><div><div className="eyebrow">Add to knowledge layer</div><h2 id="import-title">Import mainframe source</h2><p>Ingest source files into a versioned repository inventory.</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)} aria-label="Close import dialog"><X size={18} /></button></div><label>API key<input name="apiKey" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="Bearer key for this deployment" /></label><label>Tenant / node set<input name="tenantId" value={tenantId} onChange={(event) => setTenantId(event.target.value)} placeholder="PAYROLL, GL, CLAIMS, tenant-id" /></label><label>Dataset<input name="dataset" defaultValue="local-upload" required /></label><label>Repository files<input className="file-picker" type="file" multiple onChange={selectImportFiles} /></label>{selectedFiles.length > 0 && <div className="file-selection"><strong>{selectedFiles.length} files selected</strong><span>{selectedFiles.slice(0, 3).map((file) => file.webkitRelativePath || file.name).join(", ")}{selectedFiles.length > 3 ? "..." : ""}</span></div>}<label>Fallback filename<input name="filename" defaultValue="LOAN-CALC.cbl" required={selectedFiles.length === 0} /></label><label>Paste source<textarea name="code" rows={10} placeholder="Paste COBOL, JCL, PL/I, or REXX source when not selecting files..." required={selectedFiles.length === 0} /></label>{inventory && <div className="inventory-strip"><span>{inventory.totalFiles} files</span><span>{inventory.indexed} indexed</span><span>{inventory.failed} failed</span></div>}{importStatus && <div className={`modal-status ${importStatus.startsWith("The") ? "is-error" : ""}`}>{importStatus}</div>}<div className="modal-actions"><button type="button" className="outline-button" onClick={() => setImportOpen(false)}>Cancel</button><button className="dark-button" type="submit">Ingest source <ArrowUp size={15} /></button></div></form></div></div>}
   </div>;
+
+  function requestHeaders(json = false): HeadersInit {
+    return {
+      ...(json ? { "Content-Type": "application/json" } : {}),
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      ...(tenantId.trim() ? { "X-AgentMailbox-Tenant": tenantId.trim() } : {}),
+    };
+  }
 }
 
 export default App;

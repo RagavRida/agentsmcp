@@ -7,6 +7,7 @@ export interface EvidenceExportRequest {
   sourceId?: string;
   ruleId?: string;
   target?: string;
+  tenantId?: string;
   maxResults?: number;
 }
 
@@ -35,6 +36,7 @@ export interface EvidenceBundle {
 export interface EvidenceAuditRecord {
   exportId: string;
   generatedAt: string;
+  tenantId?: string;
   sourceId?: string;
   ruleId?: string;
   target?: string;
@@ -100,6 +102,7 @@ export function evidenceAuditRecord(bundle: EvidenceBundle): EvidenceAuditRecord
     exportId: bundle.metadata.exportId,
     generatedAt: bundle.metadata.generatedAt,
     sourceId: bundle.metadata.request.sourceId,
+    tenantId: bundle.metadata.request.tenantId,
     ruleId: bundle.metadata.request.ruleId,
     target: bundle.metadata.request.target,
     contentHash: bundle.metadata.contentHash,
