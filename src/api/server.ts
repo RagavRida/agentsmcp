@@ -16,11 +16,15 @@ import {
   EvidenceExportRequestSchema,
   ExtractRequestSchema,
   GraphQueryRequestSchema,
+  GroundedChatRequestSchema,
   ImpactAnalyzeRequestSchema,
   IngestRequestSchema,
   type BusinessRuleResult,
   type ExtractRequest,
   type GraphQueryRequest,
+  type GroundedChatRequest,
+  type GroundedChatResponse,
+  type GroundedCitation,
 } from "./dto";
 
 export interface PipelineOrchestratorLike {
@@ -214,6 +218,22 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
     }),
   );
 
+  app.post(
+    "/api/v1/chat/answer",
+    asyncHandler(async (req, res) => {
+      const parsedBody = GroundedChatRequestSchema.safeParse(req.body);
+      if (!parsedBody.success) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Invalid grounded chat request", parsedBody.error.flatten());
+      }
+
+      res.json(await runGroundedChat(parsedBody.data, {
+        graphSearchProvider: opts.graphSearchProvider,
+        vectorStore: opts.vectorStore,
+        localRules,
+      }));
+    }),
+  );
+
   if (webApp) {
     app.get("*", (req, res, next) => {
       if (req.path.startsWith("/api/")) {
@@ -294,6 +314,80 @@ async function runGraphSearch(
     source: "local-extract-cache",
     results,
   };
+}
+
+async function runGroundedChat(
+  request: GroundedChatRequest,
+  opts: {
+    graphSearchProvider?: GraphSearchProvider;
+    vectorStore?: VectorSearchProvider;
+    localRules: LocalRuleIndex;
+  },
+): Promise<GroundedChatResponse> {
+  const search = await runGraphSearch({
+    query: request.query,
+    limit: request.limit,
+    program: request.program,
+    domain: request.domain,
+  }, opts);
+  const usableResults = search.results.filter((result) => result.description.trim().length > 0);
+  if (usableResults.length === 0) {
+    return {
+      query: request.query,
+      answer: "I do not have grounded source evidence for that query yet. Import relevant source or try a broader business term.",
+      citations: [],
+      confidence: 0,
+      sourceIds: [],
+      unansweredReason: "NO_GROUNDED_EVIDENCE",
+    };
+  }
+
+  const citations = usableResults.slice(0, request.limit).map(resultToCitation);
+  const sourceIds = [...new Set(citations.map((citation) => citation.sourceId).filter((id): id is string => !!id))];
+  const answer = synthesizeGroundedAnswer(request.query, usableResults.slice(0, Math.min(3, usableResults.length)));
+
+  return {
+    query: request.query,
+    answer,
+    citations,
+    confidence: estimateConfidence(usableResults),
+    sourceIds,
+  };
+}
+
+function synthesizeGroundedAnswer(query: string, results: BusinessRuleResult[]): string {
+  const lead = results[0];
+  const program = lead.program ? ` in ${lead.program}` : "";
+  const related = results.slice(1).map((result) => result.description.replace(/\s+/g, " ").trim());
+  if (related.length === 0) {
+    return `${lead.description}${program}. This answer is grounded in the indexed rule ${lead.id}.`;
+  }
+  return `${lead.description}${program}. Related indexed rules also indicate: ${related.join(" ")}`;
+}
+
+function resultToCitation(result: BusinessRuleResult): GroundedCitation {
+  const metadata = result.metadata ?? {};
+  const sourceId = typeof metadata.sourceId === "string"
+    ? metadata.sourceId
+    : typeof metadata.filename === "string"
+      ? metadata.filename
+      : undefined;
+  return {
+    id: result.id,
+    label: result.description,
+    program: result.program,
+    type: result.type,
+    domain: result.domain,
+    sourceId,
+    score: result.score,
+  };
+}
+
+function estimateConfidence(results: BusinessRuleResult[]): number {
+  const bestScore = results.reduce((best, result) => Math.max(best, result.score ?? 0), 0);
+  const scoreSignal = bestScore > 0 ? Math.min(0.65, bestScore / 10) : 0.25;
+  const countSignal = Math.min(0.3, results.length * 0.08);
+  return Number(Math.min(0.95, scoreSignal + countSignal).toFixed(2));
 }
 
 function vectorResultToBusinessRule(result: SearchResult): BusinessRuleResult {

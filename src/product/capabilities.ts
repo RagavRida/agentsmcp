@@ -63,11 +63,11 @@ const CAPABILITIES: ProductCapability[] = [
   {
     id: "ai-chat-grounding",
     title: "Grounded AI chat",
-    status: "prototype",
+    status: "beta",
     category: "ai",
-    summary: "The UI supports knowledge chat and graph search, but answer citation and refusal policies need full product enforcement.",
-    evidence: ["ui/src/App.tsx", "src/eval/grounding.ts", "src/model/provider.ts"],
-    nextMilestone: "Require source evidence on every generated answer and expose no-grounding states in the UI.",
+    summary: "Chat answers are generated from retrieved business-rule evidence and return citations, confidence, source IDs, or a no-grounding refusal.",
+    evidence: ["src/api/server.ts", "src/api/dto.ts", "ui/src/App.tsx", "tests/api-server.test.ts"],
+    nextMilestone: "Add LLM narrative generation constrained to cited snippets and tenant-scoped source permissions.",
   },
   {
     id: "agent-context-handoff",

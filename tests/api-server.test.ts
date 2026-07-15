@@ -119,6 +119,69 @@ describe("AgentMailbox Memory API", () => {
     });
   });
 
+  it("answers chat queries only when grounded citations exist", async () => {
+    const graphSearchProvider = {
+      search: vi.fn(async () => [
+        {
+          id: "rule-interest",
+          program: "LOAN-CALC",
+          type: "BUSINESS_RULE",
+          domain: "Risk",
+          description: "Calculate monthly interest from principal and rate",
+          score: 0.91,
+          metadata: { sourceId: "core/LOAN.CBL" },
+        },
+      ]),
+    };
+    const url = await start(createApiApp({ graphSearchProvider }));
+
+    const res = await fetch(`${url}/api/v1/chat/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "How is interest calculated?", limit: 5 }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      query: "How is interest calculated?",
+      sourceIds: ["core/LOAN.CBL"],
+      citations: [
+        expect.objectContaining({
+          id: "rule-interest",
+          program: "LOAN-CALC",
+          sourceId: "core/LOAN.CBL",
+        }),
+      ],
+    });
+    expect(body.unansweredReason).toBeUndefined();
+    expect(body.answer).toContain("Calculate monthly interest");
+    expect(body.confidence).toBeGreaterThan(0);
+  });
+
+  it("refuses chat answers when no grounded evidence is available", async () => {
+    const graphSearchProvider = {
+      search: vi.fn(async () => []),
+    };
+    const url = await start(createApiApp({ graphSearchProvider }));
+
+    const res = await fetch(`${url}/api/v1/chat/answer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "What is the premium holiday policy?" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      citations: [],
+      confidence: 0,
+      sourceIds: [],
+      unansweredReason: "NO_GROUNDED_EVIDENCE",
+    });
+    expect(body.answer).toContain("I do not have grounded source evidence");
+  });
+
   it("returns structured validation errors", async () => {
     const url = await start(createApiApp());
 

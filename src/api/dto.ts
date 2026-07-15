@@ -83,6 +83,38 @@ export const GraphSearchResponseSchema = z.object({
 
 export type GraphSearchResponse = z.infer<typeof GraphSearchResponseSchema>;
 
+export const GroundedChatRequestSchema = z.object({
+  query: z.string().min(1).max(4_000),
+  limit: z.number().int().min(1).max(20).optional().default(6),
+  program: z.string().min(1).optional(),
+  domain: z.string().min(1).optional(),
+}).strict();
+
+export type GroundedChatRequest = z.infer<typeof GroundedChatRequestSchema>;
+
+export const GroundedCitationSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  program: z.string().optional(),
+  type: z.string(),
+  domain: z.string().optional(),
+  sourceId: z.string().optional(),
+  score: z.number().optional(),
+}).strict();
+
+export type GroundedCitation = z.infer<typeof GroundedCitationSchema>;
+
+export const GroundedChatResponseSchema = z.object({
+  query: z.string(),
+  answer: z.string(),
+  citations: z.array(GroundedCitationSchema),
+  confidence: z.number().min(0).max(1),
+  sourceIds: z.array(z.string()),
+  unansweredReason: z.string().optional(),
+}).strict();
+
+export type GroundedChatResponse = z.infer<typeof GroundedChatResponseSchema>;
+
 export const ErrorResponseSchema = z.object({
   error: z.object({
     code: z.string(),
