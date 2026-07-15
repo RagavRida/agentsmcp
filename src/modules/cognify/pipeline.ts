@@ -62,6 +62,12 @@ export interface CognifyOutput {
   status: "completed";
   program: string;
   rulesExtracted: number;
+  businessRules: Array<{
+    id: string;
+    type: string;
+    domain?: string;
+    description: string;
+  }>;
   vectorsStored: number;
   graphNodesSynced: number;
   raptorTreeDepth: number;
@@ -218,10 +224,19 @@ class TrajectoryTask implements Task<CognifyContext, CognifyOutput> {
 
   async execute(context: CognifyContext, results: TaskExecutionView): Promise<CognifyOutput> {
     const output = results.require<ByosOutput>(COGNIFY_TASK_IDS.byos);
+    const businessRules = output.nodes
+      .filter((node) => node.type === "BUSINESS_RULE")
+      .map((node) => ({
+        id: node.id,
+        type: node.type,
+        domain: node.domain,
+        description: node.description,
+      }));
     const result: CognifyOutput = {
       status: "completed",
       program: output.programName,
       rulesExtracted: output.nodes.length,
+      businessRules,
       vectorsStored: output.vectorsStored,
       graphNodesSynced: output.graphNodesSynced,
       raptorTreeDepth: output.treeDepth,

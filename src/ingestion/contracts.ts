@@ -13,9 +13,11 @@ export interface SourceArtifact {
 }
 
 export interface IngestionRequest { dataset: string; files: SourceArtifact[]; connectorRunId?: string; }
+export interface IngestedBusinessRule { id: string; type: string; domain?: string; description: string; }
 export interface IngestionFileResult { sourceId: string; filename: string; status: "indexed" | "skipped" | "failed"; checksum: string; program?: string; rulesExtracted?: number; error?: string; }
 export interface IngestionResponse { dataset: string; connectorRunId?: string; indexed: number; skipped: number; failed: number; files: IngestionFileResult[]; }
 export interface IngestionInventoryEntry extends IngestionFileResult { dataset: string; connectorRunId?: string; language?: MainframeLanguage; version?: string; lastSeenAt: string; }
 export interface IngestionInventory { datasets: string[]; totalFiles: number; indexed: number; skipped: number; failed: number; files: IngestionInventoryEntry[]; }
-export interface IngestionProcessor { process(file: SourceArtifact, dataset: string): Promise<{ program: string; rulesExtracted: number }>; }
+export interface IngestionSourceDetails extends IngestionInventoryEntry { businessRules: IngestedBusinessRule[]; }
+export interface IngestionProcessor { process(file: SourceArtifact, dataset: string): Promise<{ program: string; rulesExtracted: number; businessRules?: IngestedBusinessRule[] }>; }
 export interface SourceConnector { readonly name: string; scan(): Promise<SourceArtifact[]>; }

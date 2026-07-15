@@ -46,6 +46,12 @@ export interface RememberResult {
   status: "completed" | "errored";
   program: string;
   rulesExtracted: number;
+  businessRules?: Array<{
+    id: string;
+    type: string;
+    domain?: string;
+    description: string;
+  }>;
   vectorsStored: number;
   graphNodesSynced: number;
   raptorTreeDepth: number;

@@ -573,6 +573,19 @@ export function createServer(
     return res.status(200).json(await ingestionService.inventory());
   }));
 
+  app.get("/api/v1/ingest/sources/:sourceId", asyncHandler(async (req: Request, res: Response) => {
+    const details = await ingestionService.sourceDetails(req.params.sourceId);
+    if (!details) {
+      return res.status(404).json({
+        error: {
+          code: "SOURCE_NOT_FOUND",
+          message: `No indexed source found for ${req.params.sourceId}`,
+        },
+      });
+    }
+    return res.status(200).json(details);
+  }));
+
   // Cloud-tier rate limiting. Spec: skip entirely when AGENTSMCP_API_KEY is
   // set (self-hosted operator) — they're past the soft caps by definition.
   let rateLimiter: RateLimiterHandle | undefined;

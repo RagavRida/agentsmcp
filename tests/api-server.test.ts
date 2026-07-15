@@ -178,7 +178,18 @@ describe("AgentMailbox Memory API", () => {
         manifestStorage: new LocalStorageAdapter(root),
         processor: {
           async process(file) {
-            return { program: file.filename.replace(/\W+/g, "-").toUpperCase(), rulesExtracted: 2 };
+            return {
+              program: file.filename.replace(/\W+/g, "-").toUpperCase(),
+              rulesExtracted: 2,
+              businessRules: [
+                {
+                  id: "rule-interest",
+                  type: "BUSINESS_RULE",
+                  domain: "core-banking",
+                  description: "Calculates monthly interest from balance and rate.",
+                },
+              ],
+            };
           },
         },
       });
@@ -226,6 +237,20 @@ describe("AgentMailbox Memory API", () => {
             dataset: "core-banking",
             program: "LOAN-CBL",
             language: "cobol",
+          },
+        ],
+      });
+
+      const details = await fetch(`${url}/api/v1/ingest/sources/${encodeURIComponent("core/LOAN.CBL")}`);
+      expect(details.status).toBe(200);
+      expect(await details.json()).toMatchObject({
+        sourceId: "core/LOAN.CBL",
+        program: "LOAN-CBL",
+        rulesExtracted: 2,
+        businessRules: [
+          {
+            id: "rule-interest",
+            description: "Calculates monthly interest from balance and rate.",
           },
         ],
       });

@@ -38,7 +38,7 @@ export interface ApiServerOptions {
   pipelineOrchestrator?: PipelineOrchestratorLike;
   graphSearchProvider?: GraphSearchProvider;
   vectorStore?: VectorSearchProvider;
-  ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory">;
+  ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory" | "sourceDetails">;
 }
 
 export class ApiError extends Error {
@@ -143,6 +143,20 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
       res.json(await opts.ingestionService.inventory());
+    }),
+  );
+
+  app.get(
+    "/api/v1/ingest/sources/:sourceId",
+    asyncHandler(async (req, res) => {
+      if (!opts.ingestionService) {
+        throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
+      }
+      const details = await opts.ingestionService.sourceDetails(req.params.sourceId);
+      if (!details) {
+        throw new ApiError(404, "SOURCE_NOT_FOUND", `No indexed source found for ${req.params.sourceId}`);
+      }
+      res.json(details);
     }),
   );
 

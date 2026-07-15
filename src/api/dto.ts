@@ -138,3 +138,16 @@ export const IngestionInventorySchema = z.object({
 }).strict();
 
 export type IngestionInventory = z.infer<typeof IngestionInventorySchema>;
+
+export const IngestedBusinessRuleSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  domain: z.string().optional(),
+  description: z.string(),
+}).strict();
+
+export const IngestionSourceDetailsSchema = IngestionInventoryEntrySchema.extend({
+  businessRules: z.array(IngestedBusinessRuleSchema),
+}).strict();
+
+export type IngestionSourceDetails = z.infer<typeof IngestionSourceDetailsSchema>;
