@@ -24,6 +24,14 @@ type ProductCapabilityMatrix = {
   statuses: Record<CapabilityStatus, string>;
   capabilities: ProductCapability[];
 };
+type IngestionInventory = {
+  datasets: string[];
+  totalFiles: number;
+  indexed: number;
+  skipped: number;
+  failed: number;
+  files: Array<{ sourceId: string; filename: string; status: "indexed" | "skipped" | "failed"; program?: string; error?: string }>;
+};
 
 const API_BASE = (window as Window & { AGENTMAILBOX_API?: string }).AGENTMAILBOX_API ?? "";
 const nodes: Node[] = [
@@ -70,6 +78,8 @@ function App() {
   const [mobileNav, setMobileNav] = useState(false);
   const [importStatus, setImportStatus] = useState("");
   const [capabilityMatrix, setCapabilityMatrix] = useState<ProductCapabilityMatrix>(fallbackCapabilityMatrix);
+  const [inventory, setInventory] = useState<IngestionInventory | null>(null);
+  const [apiKey, setApiKey] = useState(() => window.localStorage.getItem("agentmailbox.apiKey") ?? "");
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes[0];
   const connectedIds = useMemo(() => new Set([selectedId, ...edges.filter(([a, b]) => a === selectedId || b === selectedId).flat()]), [selectedId]);
   const capabilityCounts = useMemo(() => capabilityMatrix.capabilities.reduce<Record<CapabilityStatus, number>>((counts, capability) => {
@@ -89,6 +99,22 @@ function App() {
       });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    void refreshInventory();
+  }, []);
+
+  async function refreshInventory() {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/ingest/inventory`, {
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      });
+      if (!response.ok) return;
+      setInventory(await response.json());
+    } catch {
+      // Inventory is optional until the ingestion service is configured.
+    }
+  }
 
   function submitSearch(event?: FormEvent) {
     event?.preventDefault();
@@ -126,14 +152,30 @@ function App() {
   async function extract(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    setImportStatus("Extracting deterministic knowledge…");
+    const filename = String(form.get("filename") ?? "SOURCE.CBL");
+    const code = String(form.get("code") ?? "");
+    const dataset = String(form.get("dataset") ?? "local-upload");
+    setImportStatus("Ingesting source batch...");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/extract`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename: form.get("filename"), code: form.get("code") }) });
-      if (!response.ok) throw new Error("Extraction failed");
+      if (apiKey) window.localStorage.setItem("agentmailbox.apiKey", apiKey);
+      const response = await fetch(`${API_BASE}/api/v1/ingest`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          dataset,
+          connectorRunId: `ui-${Date.now()}`,
+          files: [{ sourceId: `${dataset}/${filename}`, filename, code, language: "auto" }],
+        }),
+      });
+      if (!response.ok) throw new Error("Ingestion failed");
       const result = await response.json();
-      setImportStatus(`Indexed ${result.programName ?? "program"}. Search it from the workspace.`);
+      await refreshInventory();
+      setImportStatus(`Indexed ${result.indexed}, skipped ${result.skipped}, failed ${result.failed}.`);
     } catch {
-      setImportStatus("The memory API is unavailable. Start the AgentMailbox server and try again.");
+      setImportStatus("The ingestion API is unavailable or unauthorized. Check the server and API key.");
     }
   }
 
@@ -165,13 +207,13 @@ function App() {
     </aside>
     {mobileNav && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
     <main className="main-panel">
-      <header className="topbar"><div className="breadcrumbs"><button className="icon-button desktop-only" aria-label="Toggle navigation"><LayoutGrid size={16} /></button><span>Workspace</span><ChevronRight size={14} /><strong>{currentTitle}</strong></div><div className="top-actions"><span className="index-health"><span className="status-dot" /> Live index <span className="health-divider" /> 8 entities</span><button className="outline-button" onClick={() => setImportOpen(true)}><FileInput size={15} /> Import source</button><button className="avatar" aria-label="Open account menu">R</button></div></header>
+      <header className="topbar"><div className="breadcrumbs"><button className="icon-button desktop-only" aria-label="Toggle navigation"><LayoutGrid size={16} /></button><span>Workspace</span><ChevronRight size={14} /><strong>{currentTitle}</strong></div><div className="top-actions"><span className="index-health"><span className="status-dot" /> Live index <span className="health-divider" /> {inventory ? `${inventory.totalFiles} files` : "8 entities"}</span><button className="outline-button" onClick={() => setImportOpen(true)}><FileInput size={15} /> Import source</button><button className="avatar" aria-label="Open account menu">R</button></div></header>
       <section className="workspace">
         <section className="chat-column"><div className="section-heading"><div><div className="eyebrow">Knowledge chat</div><h1>Understand your estate</h1><p>Ask questions grounded in parsed source and dependency context.</p></div><button className="icon-button" aria-label="More chat options"><MoreHorizontal size={18} /></button></div><div className="conversation" id="message-list">{messages.map((message, index) => <article className={`message ${message.role}`} key={`${message.text}-${index}`}>{message.role === "assistant" && <div className="message-meta"><span className="mini-mark"><Bot size={14} /></span><span>AgentMailbox</span><time>Now</time></div>}<p>{message.text}</p>{message.detail && <p className="message-detail">{message.detail}</p>}{message.source && <div className="source-chip"><span><FileCode2 size={12} /> {message.source}</span><ChevronRight size={14} /></div>}{message.role === "assistant" && index === 0 && <button className="inline-action" onClick={() => setSelectedId("STEP-05R")}><Sparkles size={13} /> Highlight related nodes</button>}{message.role === "user" && <time>Now</time>}</article>)}</div><form className="composer" onSubmit={submitSearch}><div className="composer-label"><Search size={15} /><span>Ask the knowledge layer</span></div><textarea value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submitSearch(); }} rows={2} placeholder="Ask about a program, rule, or dependency…" aria-label="Ask AgentMailbox" /><div className="composer-footer"><span>⌘ Enter to search</span><button className="send-button" aria-label="Search knowledge graph"><ArrowUp size={17} /></button></div></form></section>
         <section className="graph-column"><div className="graph-header"><div><div className="eyebrow">{view === "settings" ? "Product truth" : "Dependency map"}</div><h2>{view === "settings" ? "Capability matrix" : "Claims processing workflow"}</h2><span className="graph-meta"><Activity size={13} /> {view === "settings" ? "Live product status labels" : "Live relationship view · updated just now"}</span></div><div className="graph-header-actions"><button className="icon-button" aria-label="Graph options"><MoreHorizontal size={18} /></button></div></div>{view === "settings" ? <CapabilityMatrix matrix={capabilityMatrix} counts={capabilityCounts} /> : <><div className="graph-toolbar"><div className="segmented" role="tablist">{(["Graph", "Flow", "Files"] as GraphMode[]).map((mode) => <button key={mode} className={graphMode === mode ? "is-active" : ""} onClick={() => setGraphMode(mode)} role="tab" aria-selected={graphMode === mode}>{mode}</button>)}</div><div className="graph-tools"><button className="icon-button" aria-label="Zoom in" onClick={() => setScale((current) => Math.min(1.35, current + .1))}><Plus size={16} /></button><button className="icon-button" aria-label="Zoom out" onClick={() => setScale((current) => Math.max(.75, current - .1))}><Minus size={16} /></button><button className="icon-button" aria-label="Fit graph" onClick={() => setScale(1)}><Maximize2 size={15} /></button></div></div><div className="graph-canvas"><svg viewBox="0 0 760 620" role="img" aria-label="Interactive business dependency graph"><g transform={`scale(${scale})`}>{edges.map(([from, to]) => { const a = nodes.find((node) => node.id === from)!; const b = nodes.find((node) => node.id === to)!; return <line key={`${from}-${to}`} className={connectedIds.has(from) && connectedIds.has(to) ? "graph-line is-connected" : "graph-line"} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />; })}{nodes.map((node) => <g key={node.id} className={`graph-node ${node.id === selectedId ? "is-selected" : ""}`} transform={`translate(${node.x} ${node.y})`} onClick={() => setSelectedId(node.id)} tabIndex={0} role="button" aria-label={`Select ${node.label}`}><circle r={node.id === selectedId ? 9 : 5} /><text x="13" y="4">{node.label}</text></g>)}</g></svg><div className="graph-legend"><span><i className="legend-dot green" /> Selected path</span><span><i className="legend-dot gray" /> Related entity</span></div><div className="graph-zoom">{Math.round(scale * 100)}%</div></div><aside className="node-inspector"><div className="inspector-heading"><span className="eyebrow">Selected entity</span><button className="icon-button" aria-label="Close inspector"><X size={15} /></button></div><div className="inspector-title"><span className="selected-dot" /><strong>{selected.label}</strong></div><p>{selected.description}</p><div className="inspector-grid"><div><span>Type</span><strong>{selected.type}</strong></div><div><span>Program</span><strong>{selected.program}</strong></div><div><span>Connections</span><strong>{connectedIds.size - 1} related</strong></div></div><button className="dark-button" onClick={() => { setQuery(`Explain ${selected.label}`); setView("chat"); }}>Open explanation <ArrowUp size={15} /></button></aside></>}</section>
       </section>
     </main>
-    {importOpen && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><form onSubmit={extract}><div className="modal-header"><div><div className="eyebrow">Add to knowledge layer</div><h2 id="import-title">Import mainframe source</h2><p>Parse a program into searchable rules and dependency context.</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)} aria-label="Close import dialog"><X size={18} /></button></div><label>Filename<input name="filename" defaultValue="LOAN-CALC.cbl" required /></label><label>Source<textarea name="code" rows={10} placeholder="Paste COBOL, JCL, PL/I, or REXX source…" required /></label>{importStatus && <div className={`modal-status ${importStatus.startsWith("The") ? "is-error" : ""}`}>{importStatus}</div>}<div className="modal-actions"><button type="button" className="outline-button" onClick={() => setImportOpen(false)}>Cancel</button><button className="dark-button" type="submit">Extract knowledge <ArrowUp size={15} /></button></div></form></div></div>}
+    {importOpen && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><form onSubmit={extract}><div className="modal-header"><div><div className="eyebrow">Add to knowledge layer</div><h2 id="import-title">Import mainframe source</h2><p>Ingest a versioned source file into the repository inventory.</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)} aria-label="Close import dialog"><X size={18} /></button></div><label>API key<input name="apiKey" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="Bearer key for this deployment" /></label><label>Dataset<input name="dataset" defaultValue="local-upload" required /></label><label>Filename<input name="filename" defaultValue="LOAN-CALC.cbl" required /></label><label>Source<textarea name="code" rows={10} placeholder="Paste COBOL, JCL, PL/I, or REXX source..." required /></label>{inventory && <div className="inventory-strip"><span>{inventory.totalFiles} files</span><span>{inventory.indexed} indexed</span><span>{inventory.failed} failed</span></div>}{importStatus && <div className={`modal-status ${importStatus.startsWith("The") ? "is-error" : ""}`}>{importStatus}</div>}<div className="modal-actions"><button type="button" className="outline-button" onClick={() => setImportOpen(false)}>Cancel</button><button className="dark-button" type="submit">Ingest source <ArrowUp size={15} /></button></div></form></div></div>}
   </div>;
 }
 

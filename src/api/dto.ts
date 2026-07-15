@@ -112,3 +112,29 @@ export const ProductCapabilityMatrixSchema = z.object({
 }).strict();
 
 export type ProductCapabilityMatrix = z.infer<typeof ProductCapabilityMatrixSchema>;
+
+export const IngestionInventoryEntrySchema = z.object({
+  sourceId: z.string(),
+  filename: z.string(),
+  status: z.enum(["indexed", "skipped", "failed"]),
+  checksum: z.string(),
+  dataset: z.string(),
+  connectorRunId: z.string().optional(),
+  language: z.enum(["auto", "cobol", "jcl", "pli", "rexx", "unknown"]).optional(),
+  version: z.string().optional(),
+  lastSeenAt: z.string(),
+  program: z.string().optional(),
+  rulesExtracted: z.number().optional(),
+  error: z.string().optional(),
+}).strict();
+
+export const IngestionInventorySchema = z.object({
+  datasets: z.array(z.string()),
+  totalFiles: z.number().int().nonnegative(),
+  indexed: z.number().int().nonnegative(),
+  skipped: z.number().int().nonnegative(),
+  failed: z.number().int().nonnegative(),
+  files: z.array(IngestionInventoryEntrySchema),
+}).strict();
+
+export type IngestionInventory = z.infer<typeof IngestionInventorySchema>;

@@ -2,7 +2,12 @@ import type { Server } from "http";
 import type { AddressInfo } from "net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiApp, type PipelineOrchestratorLike } from "../src/api/server";
+import { IngestionService } from "../src/ingestion";
+import { LocalStorageAdapter } from "../src/storage/interfaces";
 import type { ParseCobolResult } from "../src/parser";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 const SAMPLE_RESULT: ParseCobolResult = {
   programName: "LOAN-CALC",
@@ -164,6 +169,69 @@ describe("AgentMailbox Memory API", () => {
     const response = await fetch(`${url}/api/v1/ingest`);
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ endpoint: "/api/v1/ingest", method: "POST" });
+  });
+
+  it("ingests repository batches and exposes inventory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmailbox-ingest-"));
+    try {
+      const ingestionService = new IngestionService({
+        manifestStorage: new LocalStorageAdapter(root),
+        processor: {
+          async process(file) {
+            return { program: file.filename.replace(/\W+/g, "-").toUpperCase(), rulesExtracted: 2 };
+          },
+        },
+      });
+      const url = await start(createApiApp({ ingestionService }));
+      const payload = {
+        dataset: "core-banking",
+        connectorRunId: "run-001",
+        files: [
+          {
+            sourceId: "core/LOAN.CBL",
+            filename: "LOAN.CBL",
+            code: "IDENTIFICATION DIVISION. PROGRAM-ID. LOAN.",
+            language: "cobol",
+            version: "abc123",
+          },
+        ],
+      };
+
+      const first = await fetch(`${url}/api/v1/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      expect(first.status).toBe(200);
+      expect(await first.json()).toMatchObject({ indexed: 1, skipped: 0, failed: 0 });
+
+      const second = await fetch(`${url}/api/v1/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      expect(second.status).toBe(200);
+      expect(await second.json()).toMatchObject({ indexed: 0, skipped: 1, failed: 0 });
+
+      const inventory = await fetch(`${url}/api/v1/ingest/inventory`);
+      expect(inventory.status).toBe(200);
+      expect(await inventory.json()).toMatchObject({
+        datasets: ["core-banking"],
+        totalFiles: 1,
+        files: [
+          {
+            sourceId: "core/LOAN.CBL",
+            filename: "LOAN.CBL",
+            status: "skipped",
+            dataset: "core-banking",
+            program: "LOAN-CBL",
+            language: "cobol",
+          },
+        ],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("exposes an honest product capability matrix", async () => {

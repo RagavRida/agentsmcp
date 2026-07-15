@@ -201,6 +201,15 @@ describe("HTTP server (auth on)", () => {
     }));
   });
 
+  it("allows ingestion inventory with the correct Bearer token", async () => {
+    const res = await getJson(
+      `${server.url}/api/v1/ingest/inventory`,
+      { Authorization: "Bearer secret-key-1234" }
+    );
+    expect(res.status).toBe(200);
+    expect(res.data).toMatchObject({ totalFiles: 0, files: [] });
+  });
+
   it("allows requests with the correct Bearer token", async () => {
     const res = await postJson(
       `${server.url}/agents/register`,

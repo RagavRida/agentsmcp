@@ -15,6 +15,10 @@ import { validateProductionConfig } from "./config/production";
 import { defaultMetrics } from "./observability/metrics";
 import { buildHandoffContext } from "./handoff/context-builder";
 import { getProductCapabilityMatrix } from "./product/capabilities";
+import { IngestRequestSchema } from "./api/dto";
+import { IngestionService, createMemoryIngestionProcessor } from "./ingestion";
+import { getMemory } from "./memory/service";
+import { createStorageAdapterFromEnv } from "./storage/interfaces";
 import { readEnv } from "./env";
 import { logger, createHttpLogger } from "./logger";
 import {
@@ -390,6 +394,14 @@ export function createServer(
   const metrics = defaultMetrics;
   app.use(metrics.middleware());
   let cloudPool: PgPoolLike | null = null;
+  const ingestionService = new IngestionService({
+    processor: createMemoryIngestionProcessor(getMemory()),
+    manifestStorage: createStorageAdapterFromEnv({
+      localRoot: process.env.AGENTSMCP_INGESTION_STATE_DIR ?? ".agentmailbox/ingestion",
+    }),
+    manifestPrefix: "manifests",
+    inventoryKey: "inventory.json",
+  });
 
   if (cloudMode) {
     // App Runner / any HTTPS-fronted load balancer forwards client IP via
@@ -541,6 +553,25 @@ export function createServer(
   app.get("/metrics", (_req: Request, res: Response) => {
     res.type("text/plain").send(metrics.toPrometheus());
   });
+
+  app.post("/api/v1/ingest", asyncHandler(async (req: Request, res: Response) => {
+    const parsedBody = IngestRequestSchema.safeParse(req.body);
+    if (!parsedBody.success) {
+      return res.status(400).json({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Invalid ingest request",
+          details: parsedBody.error.flatten(),
+        },
+      });
+    }
+    const result = await ingestionService.ingest(parsedBody.data);
+    return res.status(result.failed > 0 ? 207 : 200).json(result);
+  }));
+
+  app.get("/api/v1/ingest/inventory", asyncHandler(async (_req: Request, res: Response) => {
+    return res.status(200).json(await ingestionService.inventory());
+  }));
 
   // Cloud-tier rate limiting. Spec: skip entirely when AGENTSMCP_API_KEY is
   // set (self-hosted operator) — they're past the soft caps by definition.

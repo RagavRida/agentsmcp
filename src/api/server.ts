@@ -38,7 +38,7 @@ export interface ApiServerOptions {
   pipelineOrchestrator?: PipelineOrchestratorLike;
   graphSearchProvider?: GraphSearchProvider;
   vectorStore?: VectorSearchProvider;
-  ingestionService?: Pick<SourceIngestionService, "ingest">;
+  ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory">;
 }
 
 export class ApiError extends Error {
@@ -135,6 +135,16 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
       requiredFields: ["dataset", "files"],
     });
   });
+
+  app.get(
+    "/api/v1/ingest/inventory",
+    asyncHandler(async (_req, res) => {
+      if (!opts.ingestionService) {
+        throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
+      }
+      res.json(await opts.ingestionService.inventory());
+    }),
+  );
 
   app.get(
     "/api/v1/graph/search",
