@@ -10,8 +10,10 @@ import { getMemory } from "../memory/service";
 import { checkModelHealth, detectModelConfig } from "../model/provider";
 import { getProductCapabilityMatrix } from "../product/capabilities";
 import { analyzeInventoryImpact } from "../impact/analysis";
+import { createEvidenceBundle } from "../evidence/export";
 import {
   ErrorResponseSchema,
+  EvidenceExportRequestSchema,
   ExtractRequestSchema,
   GraphQueryRequestSchema,
   ImpactAnalyzeRequestSchema,
@@ -40,7 +42,7 @@ export interface ApiServerOptions {
   pipelineOrchestrator?: PipelineOrchestratorLike;
   graphSearchProvider?: GraphSearchProvider;
   vectorStore?: VectorSearchProvider;
-  ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory" | "sourceDetails">;
+  ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory" | "sourceDetails" | "recordEvidenceExport">;
 }
 
 export class ApiError extends Error {
@@ -173,6 +175,24 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
       res.json(await analyzeInventoryImpact(opts.ingestionService, parsedQuery.data));
+    }),
+  );
+
+  app.get(
+    "/api/v1/evidence/export",
+    asyncHandler(async (req, res) => {
+      const parsedQuery = EvidenceExportRequestSchema.safeParse(req.query);
+      if (!parsedQuery.success) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Invalid evidence export request", parsedQuery.error.flatten());
+      }
+      if (!opts.ingestionService) {
+        throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
+      }
+      const bundle = await createEvidenceBundle(opts.ingestionService, parsedQuery.data, {
+        version: process.env.npm_package_version,
+      });
+      res.setHeader("Content-Disposition", `attachment; filename="${bundle.metadata.exportId}.json"`);
+      res.json(bundle);
     }),
   );
 

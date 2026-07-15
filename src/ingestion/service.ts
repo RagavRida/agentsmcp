@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import type { Memory } from "../memory/api";
 import type { StorageAdapter } from "../storage/interfaces";
 import type { IngestionInventory, IngestionInventoryEntry, IngestionProcessor, IngestionRequest, IngestionResponse, SourceArtifact, IngestionFileResult, IngestionSourceDetails } from "./contracts";
+import { evidenceAuditRecord, type EvidenceAuditRecord, type EvidenceBundle } from "../evidence/export";
 
 interface IngestionManifest { sourceId: string; checksum: string; version?: string; indexedAt: string; program?: string; }
-export interface IngestionServiceOptions { processor: IngestionProcessor; manifestStorage: StorageAdapter; manifestPrefix?: string; inventoryKey?: string; detailsPrefix?: string; }
+export interface IngestionServiceOptions { processor: IngestionProcessor; manifestStorage: StorageAdapter; manifestPrefix?: string; inventoryKey?: string; detailsPrefix?: string; evidencePrefix?: string; evidenceAuditKey?: string; }
 
 export class IngestionService {
   private readonly processor: IngestionProcessor;
@@ -12,7 +13,9 @@ export class IngestionService {
   private readonly prefix: string;
   private readonly inventoryKey: string;
   private readonly detailsPrefix: string;
-  constructor(options: IngestionServiceOptions) { this.processor = options.processor; this.storage = options.manifestStorage; this.prefix = options.manifestPrefix ?? "ingestion/manifests"; this.inventoryKey = options.inventoryKey ?? "ingestion/inventory.json"; this.detailsPrefix = options.detailsPrefix ?? "ingestion/details"; }
+  private readonly evidencePrefix: string;
+  private readonly evidenceAuditKey: string;
+  constructor(options: IngestionServiceOptions) { this.processor = options.processor; this.storage = options.manifestStorage; this.prefix = options.manifestPrefix ?? "ingestion/manifests"; this.inventoryKey = options.inventoryKey ?? "ingestion/inventory.json"; this.detailsPrefix = options.detailsPrefix ?? "ingestion/details"; this.evidencePrefix = options.evidencePrefix ?? "ingestion/evidence"; this.evidenceAuditKey = options.evidenceAuditKey ?? "ingestion/evidence/audit.json"; }
 
   async ingest(request: IngestionRequest): Promise<IngestionResponse> {
     const files: IngestionFileResult[] = [];
@@ -40,6 +43,14 @@ export class IngestionService {
     const raw = await this.storage.read(this.detailsKey(sourceId));
     if (!raw) return null;
     try { return JSON.parse(raw.toString("utf8")) as IngestionSourceDetails; } catch { return null; }
+  }
+
+  async recordEvidenceExport(bundle: EvidenceBundle): Promise<void> {
+    await this.storage.write(`${this.evidencePrefix}/${bundle.metadata.exportId}.json`, JSON.stringify(bundle, null, 2));
+    const raw = await this.storage.read(this.evidenceAuditKey);
+    const current = raw ? safeParseAudit(raw) : [];
+    const next = [evidenceAuditRecord(bundle), ...current.filter((record) => record.exportId !== bundle.metadata.exportId)].slice(0, 500);
+    await this.storage.write(this.evidenceAuditKey, JSON.stringify(next, null, 2));
   }
 
   private manifestKey(sourceId: string): string { return `${this.prefix}/${createHash("sha256").update(sourceId).digest("hex")}.json`; }
@@ -102,4 +113,13 @@ function summarizeInventory(files: IngestionInventoryEntry[]): IngestionInventor
     failed: sorted.filter((file) => file.status === "failed").length,
     files: sorted,
   };
+}
+
+function safeParseAudit(raw: Buffer): EvidenceAuditRecord[] {
+  try {
+    const parsed = JSON.parse(raw.toString("utf8"));
+    return Array.isArray(parsed) ? parsed as EvidenceAuditRecord[] : [];
+  } catch {
+    return [];
+  }
 }

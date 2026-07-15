@@ -170,3 +170,6 @@ export const ImpactAnalyzeRequestSchema = z.object({
 });
 
 export type ImpactAnalyzeRequest = z.infer<typeof ImpactAnalyzeRequestSchema>;
+
+export const EvidenceExportRequestSchema = ImpactAnalyzeRequestSchema;
+export type EvidenceExportRequest = z.infer<typeof EvidenceExportRequestSchema>;

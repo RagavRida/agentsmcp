@@ -5,7 +5,7 @@ import { createApiApp, type PipelineOrchestratorLike } from "../src/api/server";
 import { IngestionService } from "../src/ingestion";
 import { LocalStorageAdapter } from "../src/storage/interfaces";
 import type { ParseCobolResult } from "../src/parser";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -279,6 +279,38 @@ describe("AgentMailbox Memory API", () => {
             sourceId: "core/LOAN.CBL",
           }),
         ]),
+      });
+
+      const evidence = await fetch(`${url}/api/v1/evidence/export?sourceId=${encodeURIComponent("core/LOAN.CBL")}&ruleId=rule-interest`);
+      expect(evidence.status).toBe(200);
+      expect(evidence.headers.get("content-disposition")).toContain("attachment");
+      const bundle = await evidence.json();
+      expect(bundle).toMatchObject({
+        metadata: {
+          format: "json",
+          request: {
+            sourceId: "core/LOAN.CBL",
+            ruleId: "rule-interest",
+          },
+        },
+        source: {
+          sourceId: "core/LOAN.CBL",
+          program: "LOAN-CBL",
+        },
+        impact: {
+          target: "rule-interest",
+        },
+        audit: {
+          chainOfCustody: expect.arrayContaining(["source details document"]),
+        },
+      });
+      expect(bundle.metadata.contentHash).toMatch(/^[a-f0-9]{64}$/);
+      const audit = JSON.parse(await readFile(join(root, "ingestion/evidence/audit.json"), "utf8"));
+      expect(audit[0]).toMatchObject({
+        exportId: bundle.metadata.exportId,
+        sourceId: "core/LOAN.CBL",
+        ruleId: "rule-interest",
+        contentHash: bundle.metadata.contentHash,
       });
     } finally {
       await rm(root, { recursive: true, force: true });

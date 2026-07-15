@@ -89,11 +89,11 @@ const CAPABILITIES: ProductCapability[] = [
   {
     id: "audit-compliance-exports",
     title: "Audit and compliance exports",
-    status: "roadmap",
+    status: "beta",
     category: "governance",
-    summary: "Audit storage and backup foundations exist, but DORA-ready evidence bundles and compliance exports are not complete.",
-    evidence: ["src/cloud/audit.ts", "infra/backup-postgres.sh", "infra/test-postgres-restore.sh"],
-    nextMilestone: "Generate rule catalogs, impact reports, and evidence bundles from source-linked graph data.",
+    summary: "Exports source-linked JSON evidence bundles with inventory metadata, extracted rules, impact analysis, capability status, hashes, and persisted audit records.",
+    evidence: ["src/evidence/export.ts", "src/ingestion/service.ts", "tests/api-server.test.ts"],
+    nextMilestone: "Add signed PDF/Markdown evidence packs and tenant-scoped audit history search.",
   },
   {
     id: "expert-telemetry-enrichment",

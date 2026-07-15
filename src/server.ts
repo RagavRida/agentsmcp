@@ -15,9 +15,10 @@ import { validateProductionConfig } from "./config/production";
 import { defaultMetrics } from "./observability/metrics";
 import { buildHandoffContext } from "./handoff/context-builder";
 import { getProductCapabilityMatrix } from "./product/capabilities";
-import { ImpactAnalyzeRequestSchema, IngestRequestSchema } from "./api/dto";
+import { EvidenceExportRequestSchema, ImpactAnalyzeRequestSchema, IngestRequestSchema } from "./api/dto";
 import { IngestionService, createMemoryIngestionProcessor } from "./ingestion";
 import { analyzeInventoryImpact } from "./impact/analysis";
+import { createEvidenceBundle } from "./evidence/export";
 import { getMemory } from "./memory/service";
 import { createStorageAdapterFromEnv } from "./storage/interfaces";
 import { readEnv } from "./env";
@@ -599,6 +600,24 @@ export function createServer(
       });
     }
     return res.status(200).json(await analyzeInventoryImpact(ingestionService, parsedQuery.data));
+  }));
+
+  app.get("/api/v1/evidence/export", asyncHandler(async (req: Request, res: Response) => {
+    const parsedQuery = EvidenceExportRequestSchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      return res.status(400).json({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Invalid evidence export request",
+          details: parsedQuery.error.flatten(),
+        },
+      });
+    }
+    const bundle = await createEvidenceBundle(ingestionService, parsedQuery.data, {
+      version: getPackageVersion(),
+    });
+    res.setHeader("Content-Disposition", `attachment; filename="${bundle.metadata.exportId}.json"`);
+    return res.status(200).json(bundle);
   }));
 
   // Cloud-tier rate limiting. Spec: skip entirely when AGENTSMCP_API_KEY is
