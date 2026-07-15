@@ -328,6 +328,14 @@ describe("AgentMailbox Memory API", () => {
     expect(body.capabilities.find((item) => item.id === "mainframe-parser-registry")).toMatchObject({
       status: "live",
     });
+    expect(body.capabilities.find((item) => item.id === "impact-analysis")).toMatchObject({
+      status: "beta",
+      evidence: expect.arrayContaining(["src/impact/analysis.ts", "ui/src/App.tsx"]),
+    });
+    expect(body.capabilities.find((item) => item.id === "audit-compliance-exports")).toMatchObject({
+      status: "beta",
+      evidence: expect.arrayContaining(["src/evidence/export.ts", "tests/api-server.test.ts"]),
+    });
     expect(body.capabilities.every((item) => item.evidence.length > 0)).toBe(true);
   });
 
