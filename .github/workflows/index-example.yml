@@ -62,7 +62,7 @@ jobs:
           AGENTSMCP_SERVER: ${{ secrets.AGENTSMCP_SERVER }}
           AGENTSMCP_API_KEY: ${{ secrets.AGENTSMCP_API_KEY }}
         run: |
-          npx agentsmcp@latest agentsmcp-index \
+          npx -p agentsmcp@latest agentsmcp-index \
             --server "$AGENTSMCP_SERVER" \
             --api-key "$AGENTSMCP_API_KEY" \
             --agent-id "project@${{ github.repository }}" \

@@ -203,3 +203,11 @@ describe("cli/clients — writeClientConfig", () => {
     }
   });
 });
+
+describe("GitHub Actions index workflow template", () => {
+  it("invokes the published agentsmcp-index binary, not agentsmcp with an argument", () => {
+    const workflow = readFileSync(".github/workflows/index-example.yml", "utf8");
+    expect(workflow).toContain("npx -p agentsmcp@latest agentsmcp-index");
+    expect(workflow).not.toContain("npx agentsmcp@latest agentsmcp-index");
+  });
+});
