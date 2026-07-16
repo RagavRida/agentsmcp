@@ -164,7 +164,10 @@ describe("AgentMailbox Memory API", () => {
     const graphSearchProvider = {
       search: vi.fn(async () => []),
     };
-    const url = await start(createApiApp({ graphSearchProvider }));
+    const groundedAnswerGenerator = {
+      generate: vi.fn(async () => ({ answer: "should not be called", provider: "deterministic" as const })),
+    };
+    const url = await start(createApiApp({ graphSearchProvider, groundedAnswerGenerator }));
 
     const res = await fetch(`${url}/api/v1/chat/answer`, {
       method: "POST",
@@ -181,6 +184,7 @@ describe("AgentMailbox Memory API", () => {
       unansweredReason: "NO_GROUNDED_EVIDENCE",
     });
     expect(body.answer).toContain("I do not have grounded source evidence");
+    expect(groundedAnswerGenerator.generate).not.toHaveBeenCalled();
   });
 
   it("filters graph search and grounded chat by tenant", async () => {
@@ -202,7 +206,13 @@ describe("AgentMailbox Memory API", () => {
         },
       ]),
     };
-    const url = await start(createApiApp({ graphSearchProvider }));
+    const groundedAnswerGenerator = {
+      generate: vi.fn(async ({ results }) => ({
+        answer: results[0].description,
+        provider: "deterministic" as const,
+      })),
+    };
+    const url = await start(createApiApp({ graphSearchProvider, groundedAnswerGenerator }));
 
     const search = await fetch(`${url}/api/v1/graph/search?query=interest`, {
       headers: { "X-AgentMailbox-Tenant": "tenant-a" },
@@ -222,6 +232,10 @@ describe("AgentMailbox Memory API", () => {
     expect(chatBody.citations).toHaveLength(1);
     expect(chatBody.citations[0].id).toBe("tenant-b-rule");
     expect(chatBody.answer).toContain("Tenant B interest rule");
+    expect(groundedAnswerGenerator.generate).toHaveBeenCalledWith(expect.objectContaining({
+      results: [expect.objectContaining({ id: "tenant-b-rule" })],
+      citations: [expect.objectContaining({ id: "tenant-b-rule" })],
+    }));
   });
 
   it("returns structured validation errors", async () => {

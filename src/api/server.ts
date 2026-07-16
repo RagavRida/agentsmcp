@@ -12,6 +12,7 @@ import { checkModelHealth, detectModelConfig } from "../model/provider";
 import { getProductCapabilityMatrix } from "../product/capabilities";
 import { analyzeInventoryImpact } from "../impact/analysis";
 import { createEvidenceBundle } from "../evidence/export";
+import { DefaultGroundedAnswerGenerator, type GroundedAnswerGenerator } from "./grounded-answer";
 import {
   ErrorResponseSchema,
   EvidenceExportRequestSchema,
@@ -48,6 +49,7 @@ export interface ApiServerOptions {
   graphSearchProvider?: GraphSearchProvider;
   vectorStore?: VectorSearchProvider;
   ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory" | "sourceDetails" | "recordEvidenceExport">;
+  groundedAnswerGenerator?: GroundedAnswerGenerator;
 }
 
 export class ApiError extends Error {
@@ -232,6 +234,7 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         graphSearchProvider: opts.graphSearchProvider,
         vectorStore: opts.vectorStore,
         localRules,
+        groundedAnswerGenerator: opts.groundedAnswerGenerator,
       }));
     }),
   );
@@ -353,6 +356,7 @@ async function runGroundedChat(
     graphSearchProvider?: GraphSearchProvider;
     vectorStore?: VectorSearchProvider;
     localRules: LocalRuleIndex;
+    groundedAnswerGenerator?: GroundedAnswerGenerator;
   },
 ): Promise<GroundedChatResponse> {
   const search = await runGraphSearch({
@@ -376,25 +380,20 @@ async function runGroundedChat(
 
   const citations = usableResults.slice(0, request.limit).map(resultToCitation);
   const sourceIds = [...new Set(citations.map((citation) => citation.sourceId).filter((id): id is string => !!id))];
-  const answer = synthesizeGroundedAnswer(request.query, usableResults.slice(0, Math.min(3, usableResults.length)));
+  const generator = opts.groundedAnswerGenerator ?? new DefaultGroundedAnswerGenerator();
+  const grounded = await generator.generate({
+    query: request.query,
+    results: usableResults.slice(0, Math.min(request.limit, 6)),
+    citations,
+  });
 
   return {
     query: request.query,
-    answer,
+    answer: grounded.answer,
     citations,
     confidence: estimateConfidence(usableResults),
     sourceIds,
   };
-}
-
-function synthesizeGroundedAnswer(query: string, results: BusinessRuleResult[]): string {
-  const lead = results[0];
-  const program = lead.program ? ` in ${lead.program}` : "";
-  const related = results.slice(1).map((result) => result.description.replace(/\s+/g, " ").trim());
-  if (related.length === 0) {
-    return `${lead.description}${program}. This answer is grounded in the indexed rule ${lead.id}.`;
-  }
-  return `${lead.description}${program}. Related indexed rules also indicate: ${related.join(" ")}`;
 }
 
 function resultToCitation(result: BusinessRuleResult): GroundedCitation {

@@ -65,9 +65,9 @@ const CAPABILITIES: ProductCapability[] = [
     title: "Grounded AI chat",
     status: "beta",
     category: "ai",
-    summary: "Chat answers are generated from tenant-scoped business-rule evidence and return citations, confidence, source IDs, or a no-grounding refusal.",
-    evidence: ["src/api/server.ts", "src/api/dto.ts", "ui/src/App.tsx", "tests/api-server.test.ts"],
-    nextMilestone: "Add LLM narrative generation constrained to cited snippets and tenant-scoped model prompts.",
+    summary: "Chat answers use tenant-scoped evidence, constrained model generation when configured, citation validation, deterministic fallback, and no-grounding refusal.",
+    evidence: ["src/api/grounded-answer.ts", "src/api/server.ts", "ui/src/App.tsx", "tests/grounded-answer.test.ts", "tests/api-server.test.ts"],
+    nextMilestone: "Add tenant-scoped prompt audit records and per-answer model usage telemetry.",
   },
   {
     id: "agent-context-handoff",

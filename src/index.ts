@@ -150,6 +150,13 @@ export {
   type BusinessRuleResult,
 } from "./api/dto";
 export {
+  DefaultGroundedAnswerGenerator,
+  deterministicAnswer,
+  type GroundedAnswerGenerator,
+  type GroundedAnswerInput,
+  type GroundedAnswerOutput,
+} from "./api/grounded-answer";
+export {
   Pipeline,
   type PipelineOptions,
   type PipelineRunResult,
