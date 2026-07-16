@@ -1,11 +1,12 @@
 import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import JSZip from "jszip";
 import {
   Activity, ArrowUp, Bot, ChevronDown, ChevronRight, CircleHelp, Database,
   FileCode2, FileInput, Files, GitBranch, LayoutGrid, Maximize2, Menu,
   Minus, MoreHorizontal, Network, Plus, Search, Settings2, Sparkles, X, ZoomIn,
 } from "lucide-react";
 
-type View = "chat" | "programs" | "dataflow" | "relationships" | "explanation" | "knowledge" | "settings";
+type View = "chat" | "programs" | "dataflow" | "relationships" | "explanation" | "knowledge" | "connectors" | "model" | "settings";
 type GraphMode = "Graph" | "Flow" | "Files";
 type Node = { id: string; x: number; y: number; label: string; type: string; description: string; program: string };
 type Citation = { id: string; label: string; program?: string; type: string; domain?: string; sourceId?: string; score?: number };
@@ -58,6 +59,16 @@ type EvidenceBundle = {
   impact: ImpactAnalysisResult;
 };
 type UploadFile = File & { webkitRelativePath?: string };
+type ConnectorResponse = { connector?: string; indexed: number; skipped: number; failed: number; files?: unknown[] };
+type ModelHealth = {
+  provider: string;
+  model: string;
+  status: "ok" | "error" | "not_configured";
+  latencyMs?: number;
+  error?: string;
+  baseUrl?: string;
+  openaiCompatible?: boolean;
+};
 
 const API_BASE = (window as Window & { AGENTMAILBOX_API?: string }).AGENTMAILBOX_API ?? "";
 const MAX_IMPORT_FILES = 500;
@@ -125,6 +136,18 @@ function App() {
   const [impactStatus, setImpactStatus] = useState("");
   const [evidenceBundle, setEvidenceBundle] = useState<EvidenceBundle | null>(null);
   const [evidenceStatus, setEvidenceStatus] = useState("");
+  const [connectorDataset, setConnectorDataset] = useState("mainframe-repo");
+  const [gitRepoUrl, setGitRepoUrl] = useState("");
+  const [gitBranch, setGitBranch] = useState("");
+  const [sftpHost, setSftpHost] = useState("");
+  const [sftpPort, setSftpPort] = useState("22");
+  const [sftpUsername, setSftpUsername] = useState("");
+  const [sftpPassword, setSftpPassword] = useState("");
+  const [sftpRemotePath, setSftpRemotePath] = useState("");
+  const [connectorStatus, setConnectorStatus] = useState("");
+  const [modelHealth, setModelHealth] = useState<ModelHealth | null>(null);
+  const [modelStatus, setModelStatus] = useState("");
+  const [metricsText, setMetricsText] = useState("");
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes[0];
   const connectedIds = useMemo(() => new Set([selectedId, ...edges.filter(([a, b]) => a === selectedId || b === selectedId).flat()]), [selectedId]);
   const capabilityCounts = useMemo(() => capabilityMatrix.capabilities.reduce<Record<CapabilityStatus, number>>((counts, capability) => {
@@ -148,6 +171,10 @@ function App() {
   useEffect(() => {
     void refreshInventory();
   }, []);
+
+  useEffect(() => {
+    if (view === "model") void loadModelOps();
+  }, [view]);
 
   async function refreshInventory() {
     try {
@@ -307,6 +334,111 @@ function App() {
     }
   }
 
+  async function ingestZip(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    setConnectorStatus("Reading ZIP archive in the browser...");
+    try {
+      const zip = await JSZip.loadAsync(file);
+      const entries = Object.values(zip.files)
+        .filter((entry) => !entry.dir && shouldImportSourcePath(entry.name))
+        .slice(0, MAX_IMPORT_FILES);
+      const files = await Promise.all(entries.map(async (entry) => ({
+        sourceId: `${connectorDataset}/${entry.name}`,
+        filename: entry.name,
+        code: await entry.async("string"),
+        language: "auto",
+      })));
+      if (files.length === 0) {
+        setConnectorStatus("No supported source files were found in that ZIP archive.");
+        return;
+      }
+      await ingestConnectorFiles(files, `zip-${Date.now()}`);
+    } catch {
+      setConnectorStatus("ZIP import failed. Check that the archive is valid and under the configured API limit.");
+    }
+  }
+
+  async function ingestConnectorFiles(files: Array<{ sourceId: string; filename: string; code: string; language: string }>, connectorRunId: string) {
+    const response = await fetch(`${API_BASE}/api/v1/ingest`, {
+      method: "POST",
+      headers: requestHeaders(true),
+      body: JSON.stringify({ dataset: connectorDataset, connectorRunId, files }),
+    });
+    if (!response.ok) throw new Error("Connector ingestion failed");
+    const result = await response.json() as ConnectorResponse;
+    await refreshInventory();
+    setConnectorStatus(`Indexed ${result.indexed}, skipped ${result.skipped}, failed ${result.failed}.`);
+  }
+
+  async function connectGit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setConnectorStatus("Cloning repository and scanning source files...");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/connectors/git`, {
+        method: "POST",
+        headers: requestHeaders(true),
+        body: JSON.stringify({
+          dataset: connectorDataset,
+          repoUrl: gitRepoUrl.trim(),
+          branch: gitBranch.trim() || undefined,
+          maxFiles: MAX_IMPORT_FILES,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error?.message ?? "Git connector failed");
+      await refreshInventory();
+      setConnectorStatus(`Git connector indexed ${payload.indexed}, skipped ${payload.skipped}, failed ${payload.failed}.`);
+    } catch (error) {
+      setConnectorStatus(error instanceof Error ? error.message : "Git connector failed. Check repository access and server Git configuration.");
+    }
+  }
+
+  async function connectSftp(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setConnectorStatus("Connecting to SFTP and scanning remote source files...");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/connectors/sftp`, {
+        method: "POST",
+        headers: requestHeaders(true),
+        body: JSON.stringify({
+          dataset: connectorDataset,
+          host: sftpHost.trim(),
+          port: Number(sftpPort || 22),
+          username: sftpUsername.trim(),
+          password: sftpPassword,
+          remotePath: sftpRemotePath.trim(),
+          maxFiles: MAX_IMPORT_FILES,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload?.error?.message ?? "SFTP connector failed");
+      await refreshInventory();
+      setConnectorStatus(`SFTP connector indexed ${payload.indexed}, skipped ${payload.skipped}, failed ${payload.failed}.`);
+    } catch (error) {
+      setConnectorStatus(error instanceof Error ? error.message : "SFTP connector failed. Check credentials and remote path.");
+    }
+  }
+
+  async function loadModelOps() {
+    setModelStatus("Checking model and telemetry endpoints...");
+    try {
+      const healthResponse = await fetch(`${API_BASE}/api/v1/model/health`, { headers: requestHeaders() });
+      const health = await healthResponse.json();
+      setModelHealth(health);
+    } catch {
+      setModelHealth(null);
+    }
+    try {
+      const metricsResponse = await fetch(`${API_BASE}/metrics`, { headers: requestHeaders() });
+      setMetricsText(metricsResponse.ok ? await metricsResponse.text() : "");
+    } catch {
+      setMetricsText("");
+    }
+    setModelStatus("");
+  }
+
   const nav = [
     { label: "Chat", view: "chat" as View, icon: Bot, count: 3 },
     { label: "Graphs", view: "programs" as View, icon: Network, expandable: true },
@@ -315,12 +447,20 @@ function App() {
     { label: "File relationships", view: "relationships" as View, icon: Files, child: true },
     { label: "AI explanation", view: "explanation" as View, icon: Sparkles, child: true },
     { label: "Knowledge base", view: "knowledge" as View, icon: Database, expandable: true },
+    { label: "Connectors", view: "connectors" as View, icon: FileInput, child: true },
   ];
   const currentTitle = view === "chat"
     ? "Claims processing workflow"
+    : view === "connectors"
+      ? "Source connectors"
+      : view === "model"
+        ? "Model operations"
     : view === "settings"
       ? "Capabilities"
       : nav.find((item) => item.view === view)?.label ?? "Workspace";
+  const graphEyebrow = view === "settings" ? "Product truth" : view === "programs" ? "Repository inventory" : view === "connectors" ? "Repository access" : view === "model" ? "Operations" : "Dependency map";
+  const graphTitle = view === "settings" ? "Capability matrix" : view === "programs" ? "Programs inventory" : view === "connectors" ? "Connect source repositories" : view === "model" ? "Model and audit telemetry" : "Claims processing workflow";
+  const graphMeta = view === "settings" ? "Live product status labels" : view === "programs" ? "Indexed source estate" : view === "connectors" ? "Folder, ZIP, Git URL, and SFTP ingestion" : view === "model" ? "Provider health and Prometheus metrics" : "Live relationship view · updated just now";
 
   return <div className="app-shell">
     <button className="mobile-menu" aria-label="Open navigation" onClick={() => setMobileNav(true)}><Menu size={18} /></button>
@@ -330,7 +470,7 @@ function App() {
       <div className="nav-label">Workspace</div>
       <nav className="nav-list">{nav.map(({ label, view: navView, icon: Icon, child, count, expandable }) => <button key={`${label}-${navView}`} className={`nav-item ${child ? "nav-child" : ""} ${view === navView ? "is-active" : ""}`} onClick={() => { setView(navView); setMobileNav(false); }}><Icon size={child ? 15 : 16} strokeWidth={1.8} /><span>{label}</span>{count && <span className="nav-count">{count}</span>}{expandable && <ChevronDown className="nav-end-icon" size={14} />}</button>)}</nav>
       <div className="sidebar-spacer" />
-      <nav className="nav-list sidebar-lower"><div className="nav-label">Admin</div><button className={`nav-item ${view === "settings" ? "is-active" : ""}`} onClick={() => setView("settings")}><Settings2 size={16} /><span>Capabilities</span><ChevronRight className="nav-end-icon" size={14} /></button><button className="nav-item is-disabled"><CircleHelp size={16} /><span>Support</span></button></nav>
+      <nav className="nav-list sidebar-lower"><div className="nav-label">Admin</div><button className={`nav-item ${view === "model" ? "is-active" : ""}`} onClick={() => setView("model")}><Activity size={16} /><span>Model ops</span><ChevronRight className="nav-end-icon" size={14} /></button><button className={`nav-item ${view === "settings" ? "is-active" : ""}`} onClick={() => setView("settings")}><Settings2 size={16} /><span>Capabilities</span><ChevronRight className="nav-end-icon" size={14} /></button><button className="nav-item is-disabled"><CircleHelp size={16} /><span>Support</span></button></nav>
       <div className="sidebar-footer"><span className="status-dot" /><div><strong>Index connected</strong><small>Local workspace</small></div><button className="icon-button" aria-label="More workspace actions"><MoreHorizontal size={17} /></button></div>
     </aside>
     {mobileNav && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
@@ -338,7 +478,7 @@ function App() {
       <header className="topbar"><div className="breadcrumbs"><button className="icon-button desktop-only" aria-label="Toggle navigation"><LayoutGrid size={16} /></button><span>Workspace</span><ChevronRight size={14} /><strong>{currentTitle}</strong></div><div className="top-actions"><span className="index-health"><span className="status-dot" /> Live index <span className="health-divider" /> {inventory ? `${inventory.totalFiles} files` : "8 entities"}</span><button className="outline-button" onClick={() => setImportOpen(true)}><FileInput size={15} /> Import source</button><button className="avatar" aria-label="Open account menu">R</button></div></header>
       <section className="workspace">
         <section className="chat-column"><div className="section-heading"><div><div className="eyebrow">Knowledge chat</div><h1>Understand your estate</h1><p>Ask questions grounded in parsed source and dependency context.</p></div><button className="icon-button" aria-label="More chat options"><MoreHorizontal size={18} /></button></div><div className="conversation" id="message-list">{messages.map((message, index) => <article className={`message ${message.role}`} key={`${message.text}-${index}`}>{message.role === "assistant" && <div className="message-meta"><span className="mini-mark"><Bot size={14} /></span><span>AgentMailbox</span><time>Now</time></div>}<p>{message.text}</p>{message.detail && <p className="message-detail">{message.detail}</p>}{message.source && <div className="source-chip"><span><FileCode2 size={12} /> {message.source}</span><ChevronRight size={14} /></div>}{message.citations && message.citations.length > 0 && <div className="citation-list">{message.citations.slice(0, 4).map((citation) => <span key={`${citation.id}-${citation.sourceId ?? citation.program ?? ""}`}><FileCode2 size={11} /> {citation.program ?? citation.sourceId ?? citation.id}</span>)}</div>}{message.role === "assistant" && index === 0 && <button className="inline-action" onClick={() => setSelectedId("STEP-05R")}><Sparkles size={13} /> Highlight related nodes</button>}{message.role === "user" && <time>Now</time>}</article>)}</div><form className="composer" onSubmit={submitSearch}><div className="composer-label"><Search size={15} /><span>Ask the knowledge layer</span></div><textarea value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submitSearch(); }} rows={2} placeholder="Ask about a program, rule, or dependency…" aria-label="Ask AgentMailbox" /><div className="composer-footer"><span>⌘ Enter to search</span><button className="send-button" aria-label="Search knowledge graph"><ArrowUp size={17} /></button></div></form></section>
-        <section className="graph-column"><div className="graph-header"><div><div className="eyebrow">{view === "settings" ? "Product truth" : view === "programs" ? "Repository inventory" : "Dependency map"}</div><h2>{view === "settings" ? "Capability matrix" : view === "programs" ? "Programs inventory" : "Claims processing workflow"}</h2><span className="graph-meta"><Activity size={13} /> {view === "settings" ? "Live product status labels" : view === "programs" ? "Indexed source estate" : "Live relationship view · updated just now"}</span></div><div className="graph-header-actions"><button className="icon-button" aria-label="Graph options"><MoreHorizontal size={18} /></button></div></div>{view === "settings" ? <CapabilityMatrix matrix={capabilityMatrix} counts={capabilityCounts} /> : view === "programs" ? <ProgramInventory inventory={inventory} details={sourceDetails} detailsStatus={detailsStatus} impact={impactResult} impactStatus={impactStatus} evidence={evidenceBundle} evidenceStatus={evidenceStatus} onImport={() => setImportOpen(true)} onSelectSource={openSourceDetails} onAnalyzeImpact={analyzeImpact} onExportEvidence={exportEvidence} /> : <><div className="graph-toolbar"><div className="segmented" role="tablist">{(["Graph", "Flow", "Files"] as GraphMode[]).map((mode) => <button key={mode} className={graphMode === mode ? "is-active" : ""} onClick={() => setGraphMode(mode)} role="tab" aria-selected={graphMode === mode}>{mode}</button>)}</div><div className="graph-tools"><button className="icon-button" aria-label="Zoom in" onClick={() => setScale((current) => Math.min(1.35, current + .1))}><Plus size={16} /></button><button className="icon-button" aria-label="Zoom out" onClick={() => setScale((current) => Math.max(.75, current - .1))}><Minus size={16} /></button><button className="icon-button" aria-label="Fit graph" onClick={() => setScale(1)}><Maximize2 size={15} /></button></div></div><div className="graph-canvas"><svg viewBox="0 0 760 620" role="img" aria-label="Interactive business dependency graph"><g transform={`scale(${scale})`}>{edges.map(([from, to]) => { const a = nodes.find((node) => node.id === from)!; const b = nodes.find((node) => node.id === to)!; return <line key={`${from}-${to}`} className={connectedIds.has(from) && connectedIds.has(to) ? "graph-line is-connected" : "graph-line"} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />; })}{nodes.map((node) => <g key={node.id} className={`graph-node ${node.id === selectedId ? "is-selected" : ""}`} transform={`translate(${node.x} ${node.y})`} onClick={() => setSelectedId(node.id)} tabIndex={0} role="button" aria-label={`Select ${node.label}`}><circle r={node.id === selectedId ? 9 : 5} /><text x="13" y="4">{node.label}</text></g>)}</g></svg><div className="graph-legend"><span><i className="legend-dot green" /> Selected path</span><span><i className="legend-dot gray" /> Related entity</span></div><div className="graph-zoom">{Math.round(scale * 100)}%</div></div><aside className="node-inspector"><div className="inspector-heading"><span className="eyebrow">Selected entity</span><button className="icon-button" aria-label="Close inspector"><X size={15} /></button></div><div className="inspector-title"><span className="selected-dot" /><strong>{selected.label}</strong></div><p>{selected.description}</p><div className="inspector-grid"><div><span>Type</span><strong>{selected.type}</strong></div><div><span>Program</span><strong>{selected.program}</strong></div><div><span>Connections</span><strong>{connectedIds.size - 1} related</strong></div></div><button className="dark-button" onClick={() => { setQuery(`Explain ${selected.label}`); setView("chat"); }}>Open explanation <ArrowUp size={15} /></button></aside></>}</section>
+        <section className="graph-column"><div className="graph-header"><div><div className="eyebrow">{graphEyebrow}</div><h2>{graphTitle}</h2><span className="graph-meta"><Activity size={13} /> {graphMeta}</span></div><div className="graph-header-actions"><button className="icon-button" aria-label="Graph options"><MoreHorizontal size={18} /></button></div></div>{view === "connectors" ? <ConnectorPanel dataset={connectorDataset} gitRepoUrl={gitRepoUrl} gitBranch={gitBranch} sftpHost={sftpHost} sftpPort={sftpPort} sftpUsername={sftpUsername} sftpPassword={sftpPassword} sftpRemotePath={sftpRemotePath} status={connectorStatus} onDatasetChange={setConnectorDataset} onGitRepoUrlChange={setGitRepoUrl} onGitBranchChange={setGitBranch} onSftpHostChange={setSftpHost} onSftpPortChange={setSftpPort} onSftpUsernameChange={setSftpUsername} onSftpPasswordChange={setSftpPassword} onSftpRemotePathChange={setSftpRemotePath} onZip={ingestZip} onGit={connectGit} onSftp={connectSftp} onFolder={() => setImportOpen(true)} /> : view === "model" ? <ModelOpsPanel health={modelHealth} status={modelStatus} metricsText={metricsText} onRefresh={loadModelOps} /> : view === "settings" ? <CapabilityMatrix matrix={capabilityMatrix} counts={capabilityCounts} /> : view === "programs" ? <ProgramInventory inventory={inventory} details={sourceDetails} detailsStatus={detailsStatus} impact={impactResult} impactStatus={impactStatus} evidence={evidenceBundle} evidenceStatus={evidenceStatus} onImport={() => setImportOpen(true)} onSelectSource={openSourceDetails} onAnalyzeImpact={analyzeImpact} onExportEvidence={exportEvidence} /> : <><div className="graph-toolbar"><div className="segmented" role="tablist">{(["Graph", "Flow", "Files"] as GraphMode[]).map((mode) => <button key={mode} className={graphMode === mode ? "is-active" : ""} onClick={() => setGraphMode(mode)} role="tab" aria-selected={graphMode === mode}>{mode}</button>)}</div><div className="graph-tools"><button className="icon-button" aria-label="Zoom in" onClick={() => setScale((current) => Math.min(1.35, current + .1))}><Plus size={16} /></button><button className="icon-button" aria-label="Zoom out" onClick={() => setScale((current) => Math.max(.75, current - .1))}><Minus size={16} /></button><button className="icon-button" aria-label="Fit graph" onClick={() => setScale(1)}><Maximize2 size={15} /></button></div></div><div className="graph-canvas"><svg viewBox="0 0 760 620" role="img" aria-label="Interactive business dependency graph"><g transform={`scale(${scale})`}>{edges.map(([from, to]) => { const a = nodes.find((node) => node.id === from)!; const b = nodes.find((node) => node.id === to)!; return <line key={`${from}-${to}`} className={connectedIds.has(from) && connectedIds.has(to) ? "graph-line is-connected" : "graph-line"} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />; })}{nodes.map((node) => <g key={node.id} className={`graph-node ${node.id === selectedId ? "is-selected" : ""}`} transform={`translate(${node.x} ${node.y})`} onClick={() => setSelectedId(node.id)} tabIndex={0} role="button" aria-label={`Select ${node.label}`}><circle r={node.id === selectedId ? 9 : 5} /><text x="13" y="4">{node.label}</text></g>)}</g></svg><div className="graph-legend"><span><i className="legend-dot green" /> Selected path</span><span><i className="legend-dot gray" /> Related entity</span></div><div className="graph-zoom">{Math.round(scale * 100)}%</div></div><aside className="node-inspector"><div className="inspector-heading"><span className="eyebrow">Selected entity</span><button className="icon-button" aria-label="Close inspector"><X size={15} /></button></div><div className="inspector-title"><span className="selected-dot" /><strong>{selected.label}</strong></div><p>{selected.description}</p><div className="inspector-grid"><div><span>Type</span><strong>{selected.type}</strong></div><div><span>Program</span><strong>{selected.program}</strong></div><div><span>Connections</span><strong>{connectedIds.size - 1} related</strong></div></div><DependencyChain selected={selected} connectedIds={connectedIds} /><button className="dark-button" onClick={() => { setQuery(`Explain ${selected.label}`); setView("chat"); }}>Open explanation <ArrowUp size={15} /></button></aside></>}</section>
       </section>
     </main>
     {importOpen && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><form onSubmit={extract}><div className="modal-header"><div><div className="eyebrow">Add to knowledge layer</div><h2 id="import-title">Connect repository source</h2><p>Choose a repository folder or selected source files to ingest into the tenant-scoped knowledge layer.</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)} aria-label="Close import dialog"><X size={18} /></button></div><label>API key<input name="apiKey" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="Bearer key for this deployment" /></label><label>Tenant / node set<input name="tenantId" value={tenantId} onChange={(event) => setTenantId(event.target.value)} placeholder="PAYROLL, GL, CLAIMS, tenant-id" /></label><label>Dataset<input name="dataset" defaultValue="local-upload" required /></label><label>Repository folder<input className="file-picker" type="file" multiple onChange={selectImportFiles} {...{ webkitdirectory: "true", directory: "true" }} /></label><label>Source files<input className="file-picker" type="file" multiple onChange={selectImportFiles} accept=".cbl,.cob,.cobol,.cpy,.copy,.jcl,.job,.pli,.pl1,.rexx,.rex,.sql,.txt" /></label>{selectedFiles.length > 0 && <div className="file-selection"><strong>{selectedFiles.filter(shouldImportSourceFile).slice(0, MAX_IMPORT_FILES).length} importable files</strong><span>{selectedFiles.slice(0, 3).map((file) => file.webkitRelativePath || file.name).join(", ")}{selectedFiles.length > 3 ? "..." : ""}</span></div>}<label>Fallback filename<input name="filename" defaultValue="LOAN-CALC.cbl" required={selectedFiles.length === 0} /></label><label>Paste source<textarea name="code" rows={10} placeholder="Paste COBOL, JCL, PL/I, or REXX source when not selecting files..." required={selectedFiles.length === 0} /></label>{inventory && <div className="inventory-strip"><span>{inventory.totalFiles} files</span><span>{inventory.indexed} indexed</span><span>{inventory.failed} failed</span></div>}{importStatus && <div className={`modal-status ${importStatus.startsWith("The") ? "is-error" : ""}`}>{importStatus}</div>}<div className="modal-actions"><button type="button" className="outline-button" onClick={() => setImportOpen(false)}>Cancel</button><button className="dark-button" type="submit">Ingest source <ArrowUp size={15} /></button></div></form></div></div>}
@@ -353,8 +493,7 @@ function App() {
   }
 }
 
-function shouldImportSourceFile(file: UploadFile): boolean {
-  const path = file.webkitRelativePath || file.name;
+function shouldImportSourcePath(path: string): boolean {
   const segments = path.split(/[\\/]+/);
   if (segments.some((segment) => IGNORED_REPO_SEGMENTS.has(segment))) return false;
   const lower = path.toLowerCase();
@@ -363,7 +502,115 @@ function shouldImportSourceFile(file: UploadFile): boolean {
   return SOURCE_EXTENSIONS.has(lower.slice(dot));
 }
 
+function shouldImportSourceFile(file: UploadFile): boolean {
+  return shouldImportSourcePath(file.webkitRelativePath || file.name);
+}
+
 export default App;
+
+function ConnectorPanel(props: {
+  dataset: string;
+  gitRepoUrl: string;
+  gitBranch: string;
+  sftpHost: string;
+  sftpPort: string;
+  sftpUsername: string;
+  sftpPassword: string;
+  sftpRemotePath: string;
+  status: string;
+  onDatasetChange: (value: string) => void;
+  onGitRepoUrlChange: (value: string) => void;
+  onGitBranchChange: (value: string) => void;
+  onSftpHostChange: (value: string) => void;
+  onSftpPortChange: (value: string) => void;
+  onSftpUsernameChange: (value: string) => void;
+  onSftpPasswordChange: (value: string) => void;
+  onSftpRemotePathChange: (value: string) => void;
+  onZip: (event: ChangeEvent<HTMLInputElement>) => void;
+  onGit: (event: FormEvent<HTMLFormElement>) => void;
+  onSftp: (event: FormEvent<HTMLFormElement>) => void;
+  onFolder: () => void;
+}) {
+  return <div className="ops-panel">
+    <section className="connector-hero">
+      <div>
+        <span className="eyebrow">Enterprise source access</span>
+        <h3>Connect the estate without hardcoded paths</h3>
+        <p>Every connector feeds the same tenant-scoped ingestion pipeline, so inventory, rules, impact analysis, graph search, and evidence exports stay consistent.</p>
+      </div>
+      <label className="compact-field">Dataset / node set<input value={props.dataset} onChange={(event) => props.onDatasetChange(event.target.value)} /></label>
+    </section>
+    <div className="connector-grid">
+      <article className="connector-card">
+        <div><span className="eyebrow">Browser</span><h3>Repository folder</h3><p>Select a local clone when the source is already mounted on the analyst workstation.</p></div>
+        <button className="dark-button" onClick={props.onFolder}><FileInput size={14} /> Open folder import</button>
+      </article>
+      <article className="connector-card">
+        <div><span className="eyebrow">Browser</span><h3>ZIP archive</h3><p>Extracts source in the browser, filters generated/vendor folders, and sends only supported source files.</p></div>
+        <label className="zip-drop"><FileInput size={15} /> Choose ZIP<input type="file" accept=".zip" onChange={props.onZip} /></label>
+      </article>
+      <form className="connector-card" onSubmit={props.onGit}>
+        <div><span className="eyebrow">Server</span><h3>Git URL</h3><p>Server-side shallow clone for enterprise Git providers, SSH remotes, and authenticated network paths.</p></div>
+        <label>Repository URL<input value={props.gitRepoUrl} onChange={(event) => props.onGitRepoUrlChange(event.target.value)} placeholder="https://github.enterprise/app/mainframe.git" required /></label>
+        <label>Branch<input value={props.gitBranch} onChange={(event) => props.onGitBranchChange(event.target.value)} placeholder="main, release/2026-q3" /></label>
+        <button className="dark-button" type="submit"><GitBranch size={14} /> Connect Git</button>
+      </form>
+      <form className="connector-card" onSubmit={props.onSftp}>
+        <div><span className="eyebrow">Server</span><h3>SFTP / mainframe drop</h3><p>Reads source from secure transfer directories used by mainframe build and release flows.</p></div>
+        <div className="field-row"><label>Host<input value={props.sftpHost} onChange={(event) => props.onSftpHostChange(event.target.value)} placeholder="sftp.enterprise.local" required /></label><label>Port<input value={props.sftpPort} onChange={(event) => props.onSftpPortChange(event.target.value)} inputMode="numeric" required /></label></div>
+        <label>Username<input value={props.sftpUsername} onChange={(event) => props.onSftpUsernameChange(event.target.value)} required /></label>
+        <label>Password<input value={props.sftpPassword} onChange={(event) => props.onSftpPasswordChange(event.target.value)} type="password" required /></label>
+        <label>Remote path<input value={props.sftpRemotePath} onChange={(event) => props.onSftpRemotePathChange(event.target.value)} placeholder="/u/app/source" required /></label>
+        <button className="dark-button" type="submit"><Database size={14} /> Connect SFTP</button>
+      </form>
+    </div>
+    {props.status && <div className="connector-status">{props.status}</div>}
+  </div>;
+}
+
+function ModelOpsPanel({ health, status, metricsText, onRefresh }: { health: ModelHealth | null; status: string; metricsText: string; onRefresh: () => void }) {
+  const modelMetrics = metricsText.split("\n").filter((line) => /model|llm|token|latency|request/i.test(line) && !line.startsWith("#")).slice(0, 8);
+  return <div className="ops-panel">
+    <section className="connector-hero">
+      <div>
+        <span className="eyebrow">On-prem model connection</span>
+        <h3>Provider health and usage audit</h3>
+        <p>The UI reads the same model health endpoint used by deployment checks and Prometheus metrics exposed by the production server.</p>
+      </div>
+      <button className="outline-button" onClick={onRefresh}><Activity size={14} /> Refresh</button>
+    </section>
+    <div className="model-grid">
+      <article className="model-card">
+        <span className="eyebrow">Provider</span>
+        <h3>{health?.provider ?? "Unknown"}</h3>
+        <p>{health?.baseUrl ?? "No model base URL reported by this deployment."}</p>
+      </article>
+      <article className="model-card">
+        <span className="eyebrow">Model</span>
+        <h3>{health?.model ?? "Unknown"}</h3>
+        <p>{health?.openaiCompatible ? "OpenAI-compatible chat completions API" : "Native provider API or not configured"}</p>
+      </article>
+      <article className="model-card">
+        <span className="eyebrow">Status</span>
+        <h3 className={`model-status-${health?.status ?? "error"}`}>{health?.status ?? "unavailable"}</h3>
+        <p>{health?.latencyMs ? `${health.latencyMs} ms health check` : health?.error ?? "Refresh to verify the current endpoint."}</p>
+      </article>
+    </div>
+    <section className="metrics-panel">
+      <div><span className="eyebrow">Audit trail</span><h3>Runtime metrics</h3></div>
+      {status && <p>{status}</p>}
+      {modelMetrics.length === 0 ? <p>No model-specific metrics are exposed yet. The `/metrics` endpoint is reachable when the production server is running.</p> : <pre>{modelMetrics.join("\n")}</pre>}
+    </section>
+  </div>;
+}
+
+function DependencyChain({ selected, connectedIds }: { selected: Node; connectedIds: Set<string> }) {
+  const connected = nodes.filter((node) => node.id !== selected.id && connectedIds.has(node.id));
+  return <div className="dependency-chain">
+    <span className="eyebrow">Dependency chain</span>
+    {connected.length === 0 ? <p>No adjacent entities are highlighted.</p> : connected.map((node) => <div key={node.id} className="chain-row"><span>{selected.label}</span><ChevronRight size={13} /><strong>{node.label}</strong></div>)}
+  </div>;
+}
 
 function CapabilityMatrix({ matrix, counts }: { matrix: ProductCapabilityMatrix; counts: Record<CapabilityStatus, number> }) {
   return <div className="capability-panel">

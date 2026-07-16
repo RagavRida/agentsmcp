@@ -18,6 +18,40 @@ export const ExtractRequestSchema = z.object({
 
 export type ExtractRequest = z.infer<typeof ExtractRequestSchema>;
 
+const ConnectorDatasetSchema = z.string().min(1).max(256);
+const ConnectorRunIdSchema = z.string().min(1).max(256).optional();
+const ConnectorMaxFilesSchema = z.number().int().min(1).max(500).optional();
+
+export const GitConnectorRequestSchema = z.object({
+  dataset: ConnectorDatasetSchema,
+  tenantId: z.string().min(1).max(256).optional(),
+  connectorRunId: ConnectorRunIdSchema,
+  repoUrl: z.string().min(1).max(2048),
+  branch: z.string().min(1).max(256).optional(),
+  maxFiles: ConnectorMaxFilesSchema,
+}).strict();
+
+export type GitConnectorRequest = z.infer<typeof GitConnectorRequestSchema>;
+
+export const SftpConnectorRequestSchema = z.object({
+  dataset: ConnectorDatasetSchema,
+  tenantId: z.string().min(1).max(256).optional(),
+  connectorRunId: ConnectorRunIdSchema,
+  host: z.string().min(1).max(512),
+  port: z.number().int().min(1).max(65535).optional(),
+  username: z.string().min(1).max(256),
+  password: z.string().min(1).max(4096).optional(),
+  privateKey: z.string().min(1).max(100_000).optional(),
+  passphrase: z.string().min(1).max(4096).optional(),
+  remotePath: z.string().min(1).max(2048),
+  maxFiles: ConnectorMaxFilesSchema,
+}).strict().refine((value) => Boolean(value.password || value.privateKey), {
+  message: "password or privateKey is required",
+  path: ["password"],
+});
+
+export type SftpConnectorRequest = z.infer<typeof SftpConnectorRequestSchema>;
+
 const QueryTextSchema = z.preprocess((value) => {
   if (Array.isArray(value)) return value[0];
   return value;

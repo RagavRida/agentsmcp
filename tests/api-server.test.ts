@@ -5,9 +5,10 @@ import { createApiApp, type PipelineOrchestratorLike } from "../src/api/server";
 import { IngestionService } from "../src/ingestion";
 import { LocalStorageAdapter } from "../src/storage/interfaces";
 import type { ParseCobolResult } from "../src/parser";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { collectSourceArtifactsFromDirectory, isImportableSourcePath } from "../src/ingestion/connectors";
 
 const SAMPLE_RESULT: ParseCobolResult = {
   programName: "LOAN-CALC",
@@ -288,6 +289,59 @@ describe("AgentMailbox Memory API", () => {
     const response = await fetch(`${url}/api/v1/ingest`);
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ endpoint: "/api/v1/ingest", method: "POST" });
+  });
+
+  it("describes configured repository connectors", async () => {
+    const url = await start(createApiApp());
+    const response = await fetch(`${url}/api/v1/connectors`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      connectors: expect.arrayContaining([
+        expect.objectContaining({ id: "browser-folder", status: "live" }),
+        expect.objectContaining({ id: "zip", status: "live" }),
+        expect.objectContaining({ id: "git", endpoint: "/api/v1/connectors/git" }),
+        expect.objectContaining({ id: "sftp", endpoint: "/api/v1/connectors/sftp" }),
+      ]),
+      limits: expect.objectContaining({ maxFiles: 500 }),
+    });
+  });
+
+  it("collects source artifacts from directories without indexing generated folders", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmailbox-connectors-"));
+    try {
+      await mkdir(join(root, "src"), { recursive: true });
+      await mkdir(join(root, ".git"), { recursive: true });
+      await mkdir(join(root, "node_modules", "pkg"), { recursive: true });
+      await writeFile(join(root, "src", "CLAIMS.CBL"), "IDENTIFICATION DIVISION. PROGRAM-ID. CLAIMS.");
+      await writeFile(join(root, "src", "README.md"), "# generated docs");
+      await writeFile(join(root, ".git", "config"), "ignored");
+      await writeFile(join(root, "node_modules", "pkg", "FAKE.CBL"), "ignored");
+
+      expect(isImportableSourcePath("src/CLAIMS.CBL")).toBe(true);
+      expect(isImportableSourcePath("node_modules/pkg/FAKE.CBL")).toBe(false);
+      expect(isImportableSourcePath("src/README.md")).toBe(false);
+
+      const artifacts = await collectSourceArtifactsFromDirectory(root, {
+        dataset: "claims",
+        tenantId: "tenant-a",
+        connectorRunId: "folder-001",
+      });
+      expect(artifacts).toMatchObject({
+        dataset: "claims",
+        connectorRunId: "folder-001",
+        files: [
+          expect.objectContaining({
+            sourceId: "claims/src/CLAIMS.CBL",
+            filename: "src/CLAIMS.CBL",
+            tenantId: "tenant-a",
+            language: "auto",
+          }),
+        ],
+      });
+      expect(artifacts.files).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("ingests repository batches and exposes inventory", async () => {

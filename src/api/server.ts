@@ -4,7 +4,13 @@ import fs from "node:fs";
 import { ZodError } from "zod";
 import { parseCobol, type ParseCobolResult, type SemanticNodeCompact } from "../parser";
 import type { SearchResult } from "../vector/store";
-import { IngestionService as SourceIngestionService, createMemoryIngestionProcessor } from "../ingestion";
+import {
+  IngestionService as SourceIngestionService,
+  cloneGitRepository,
+  connectorArtifactsToIngestionRequest,
+  createMemoryIngestionProcessor,
+  readSftpRepository,
+} from "../ingestion";
 import type { TenantScope } from "../ingestion/contracts";
 import { createStorageAdapterFromEnv } from "../storage/interfaces";
 import { getMemory } from "../memory/service";
@@ -17,10 +23,12 @@ import {
   ErrorResponseSchema,
   EvidenceExportRequestSchema,
   ExtractRequestSchema,
+  GitConnectorRequestSchema,
   GraphQueryRequestSchema,
   GroundedChatRequestSchema,
   ImpactAnalyzeRequestSchema,
   IngestRequestSchema,
+  SftpConnectorRequestSchema,
   type BusinessRuleResult,
   type ExtractRequest,
   type GraphQueryRequest,
@@ -72,7 +80,7 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
   const localRules = new LocalRuleIndex();
   const webApp = resolveWebAppPaths();
 
-  app.use(express.json({ limit: "5mb" }));
+  app.use(express.json({ limit: process.env.AGENTSMCP_API_JSON_LIMIT ?? "25mb" }));
   if (webApp) {
     app.use(express.static(webApp.root, {
       index: false,
@@ -107,6 +115,21 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
 
   app.get("/api/v1/product/capabilities", (_req, res) => {
     res.json(getProductCapabilityMatrix());
+  });
+
+  app.get("/api/v1/connectors", (_req, res) => {
+    res.json({
+      connectors: [
+        { id: "browser-folder", mode: "client", status: "live", description: "Browser-selected repository folder upload" },
+        { id: "zip", mode: "client", status: "live", description: "Browser ZIP archive extraction and ingestion" },
+        { id: "git", mode: "server", status: "live", endpoint: "/api/v1/connectors/git" },
+        { id: "sftp", mode: "server", status: "live", endpoint: "/api/v1/connectors/sftp" },
+      ],
+      limits: {
+        maxFiles: 500,
+        jsonLimit: process.env.AGENTSMCP_API_JSON_LIMIT ?? "25mb",
+      },
+    });
   });
 
   app.post(
@@ -146,6 +169,46 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
       requiredFields: ["dataset", "files"],
     });
   });
+
+  app.post(
+    "/api/v1/connectors/git",
+    asyncHandler(async (req, res) => {
+      const parsedBody = GitConnectorRequestSchema.safeParse(req.body);
+      if (!parsedBody.success) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Invalid Git connector request", parsedBody.error.flatten());
+      }
+      if (!opts.ingestionService) {
+        throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
+      }
+      const scope = tenantScopeFromRequest(req);
+      const artifacts = await cloneGitRepository(withTenant(parsedBody.data, scope));
+      if (artifacts.files.length === 0) {
+        throw new ApiError(422, "NO_IMPORTABLE_SOURCES", "The repository did not contain supported mainframe source files");
+      }
+      const result = await opts.ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+      res.status(result.failed > 0 ? 207 : 200).json({ connector: "git", ...result });
+    }),
+  );
+
+  app.post(
+    "/api/v1/connectors/sftp",
+    asyncHandler(async (req, res) => {
+      const parsedBody = SftpConnectorRequestSchema.safeParse(req.body);
+      if (!parsedBody.success) {
+        throw new ApiError(400, "VALIDATION_ERROR", "Invalid SFTP connector request", parsedBody.error.flatten());
+      }
+      if (!opts.ingestionService) {
+        throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
+      }
+      const scope = tenantScopeFromRequest(req);
+      const artifacts = await readSftpRepository(withTenant(parsedBody.data, scope));
+      if (artifacts.files.length === 0) {
+        throw new ApiError(422, "NO_IMPORTABLE_SOURCES", "The SFTP path did not contain supported mainframe source files");
+      }
+      const result = await opts.ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+      res.status(result.failed > 0 ? 207 : 200).json({ connector: "sftp", ...result });
+    }),
+  );
 
   app.get(
     "/api/v1/ingest/inventory",

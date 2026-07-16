@@ -15,12 +15,25 @@ import { validateProductionConfig } from "./config/production";
 import { defaultMetrics } from "./observability/metrics";
 import { buildHandoffContext } from "./handoff/context-builder";
 import { getProductCapabilityMatrix } from "./product/capabilities";
-import { EvidenceExportRequestSchema, ImpactAnalyzeRequestSchema, IngestRequestSchema } from "./api/dto";
-import { IngestionService, createMemoryIngestionProcessor } from "./ingestion";
+import {
+  EvidenceExportRequestSchema,
+  GitConnectorRequestSchema,
+  ImpactAnalyzeRequestSchema,
+  IngestRequestSchema,
+  SftpConnectorRequestSchema,
+} from "./api/dto";
+import {
+  IngestionService,
+  cloneGitRepository,
+  connectorArtifactsToIngestionRequest,
+  createMemoryIngestionProcessor,
+  readSftpRepository,
+} from "./ingestion";
 import type { TenantScope } from "./ingestion/contracts";
 import { analyzeInventoryImpact } from "./impact/analysis";
 import { createEvidenceBundle } from "./evidence/export";
 import { getMemory } from "./memory/service";
+import { checkModelHealth, detectModelConfig } from "./model/provider";
 import { createStorageAdapterFromEnv } from "./storage/interfaces";
 import { readEnv } from "./env";
 import { logger, createHttpLogger } from "./logger";
@@ -459,7 +472,7 @@ export function createServer(
     );
   }
 
-  app.use(express.json({ limit: "1mb" }));
+  app.use(express.json({ limit: process.env.AGENTSMCP_API_JSON_LIMIT ?? "25mb" }));
 
   // Structured request logging (pino-http). `req.log` is always attached so
   // any handler can emit request-correlated logs; automatic per-request
@@ -572,6 +585,16 @@ export function createServer(
   };
   app.use(requireApiKey);
 
+  app.get("/api/v1/model/health", asyncHandler(async (_req: Request, res: Response) => {
+    const config = detectModelConfig();
+    const health = await checkModelHealth(config);
+    return res.status(health.status === "error" ? 503 : 200).json({
+      ...health,
+      baseUrl: config.baseUrl,
+      openaiCompatible: config.openaiCompatible,
+    });
+  }));
+
   app.get("/metrics", (_req: Request, res: Response) => {
     res.type("text/plain").send(metrics.toPrometheus());
   });
@@ -589,6 +612,71 @@ export function createServer(
     }
     const result = await ingestionService.ingest(withTenant(parsedBody.data, tenantScopeFromRequest(req)));
     return res.status(result.failed > 0 ? 207 : 200).json(result);
+  }));
+
+  app.get("/api/v1/connectors", (_req: Request, res: Response) => {
+    return res.status(200).json({
+      connectors: [
+        { id: "browser-folder", mode: "client", status: "live", description: "Browser-selected repository folder upload" },
+        { id: "zip", mode: "client", status: "live", description: "Browser ZIP archive extraction and ingestion" },
+        { id: "git", mode: "server", status: "live", endpoint: "/api/v1/connectors/git" },
+        { id: "sftp", mode: "server", status: "live", endpoint: "/api/v1/connectors/sftp" },
+      ],
+      limits: {
+        maxFiles: 500,
+        jsonLimit: process.env.AGENTSMCP_API_JSON_LIMIT ?? "25mb",
+      },
+    });
+  });
+
+  app.post("/api/v1/connectors/git", asyncHandler(async (req: Request, res: Response) => {
+    const parsedBody = GitConnectorRequestSchema.safeParse(req.body);
+    if (!parsedBody.success) {
+      return res.status(400).json({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Invalid Git connector request",
+          details: parsedBody.error.flatten(),
+        },
+      });
+    }
+    const scope = tenantScopeFromRequest(req);
+    const artifacts = await cloneGitRepository(withTenant(parsedBody.data, scope));
+    if (artifacts.files.length === 0) {
+      return res.status(422).json({
+        error: {
+          code: "NO_IMPORTABLE_SOURCES",
+          message: "The repository did not contain supported mainframe source files",
+        },
+      });
+    }
+    const result = await ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+    return res.status(result.failed > 0 ? 207 : 200).json({ connector: "git", ...result });
+  }));
+
+  app.post("/api/v1/connectors/sftp", asyncHandler(async (req: Request, res: Response) => {
+    const parsedBody = SftpConnectorRequestSchema.safeParse(req.body);
+    if (!parsedBody.success) {
+      return res.status(400).json({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Invalid SFTP connector request",
+          details: parsedBody.error.flatten(),
+        },
+      });
+    }
+    const scope = tenantScopeFromRequest(req);
+    const artifacts = await readSftpRepository(withTenant(parsedBody.data, scope));
+    if (artifacts.files.length === 0) {
+      return res.status(422).json({
+        error: {
+          code: "NO_IMPORTABLE_SOURCES",
+          message: "The SFTP path did not contain supported mainframe source files",
+        },
+      });
+    }
+    const result = await ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+    return res.status(result.failed > 0 ? 207 : 200).json({ connector: "sftp", ...result });
   }));
 
   app.get("/api/v1/ingest/inventory", asyncHandler(async (req: Request, res: Response) => {
