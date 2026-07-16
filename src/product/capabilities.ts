@@ -47,9 +47,9 @@ const CAPABILITIES: ProductCapability[] = [
     title: "Mainframe repository ingestion",
     status: "beta",
     category: "ingestion",
-    summary: "Accepts versioned source batches through the ingestion API and records ingestion manifests.",
-    evidence: ["src/ingestion/service.ts", "src/api/server.ts", "tests/integration/memory.test.ts"],
-    nextMilestone: "Add first-class ZIP, mounted folder, Git, and SFTP connector flows in the UI.",
+    summary: "Accepts versioned source batches through the ingestion API, records ingestion manifests, and supports browser folder import for repository source trees.",
+    evidence: ["src/ingestion/service.ts", "src/api/server.ts", "ui/src/App.tsx", "tests/integration/memory.test.ts"],
+    nextMilestone: "Add first-class Git URL, ZIP archive, mounted folder, and SFTP connector flows.",
   },
   {
     id: "impact-analysis",
