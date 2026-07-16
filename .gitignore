@@ -8,6 +8,10 @@ sdk-py/dist/
 
 # Build output
 dist/
+dist-electron/
+release/
+.electron-gyp/
+.electron-home/
 *.tsbuildinfo
 
 # Local databases / WAL

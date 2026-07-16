@@ -18,6 +18,10 @@
   ],
   "scripts": {
     "build": "cd parser && npx tsc -p tsconfig.cjs.json && cd .. && npm run clean && tsc && npx tsc scripts/index-codebase.ts --outDir dist/scripts --target ES2020 --module commonjs --esModuleInterop --skipLibCheck --resolveJsonModule && node scripts/finalize-mcp.js && npm run build:web",
+    "build:desktop": "npm run build && tsc -p electron/tsconfig.json",
+    "dev:electron": "npm run build:desktop && AGENTMAILBOX_NODE_PATH=$(command -v node) electron dist-electron/main.js",
+    "package:mac:dir": "npm run build:desktop && sh -c 'trap \"npm rebuild better-sqlite3 cpu-features\" EXIT; HOME=.electron-home npm_config_devdir=.electron-gyp electron-builder --mac --dir'",
+    "package:mac": "npm run build:desktop && sh -c 'trap \"npm rebuild better-sqlite3 cpu-features\" EXIT; HOME=.electron-home npm_config_devdir=.electron-gyp electron-builder --mac'",
     "build:web": "vite build && tsc -p tsconfig.ui.json --noEmit",
     "eval:llm-judge": "ts-node scripts/run-llm-judge.ts",
     "start": "ts-node src/server.ts",
@@ -42,10 +46,37 @@
     "url": "git+https://github.com/RagavRida/agentsmcp.git"
   },
   "homepage": "https://agentmailbox.vercel.app",
+  "author": "AgentMailbox",
   "bugs": {
     "url": "https://github.com/RagavRida/agentsmcp/issues"
   },
   "license": "MIT",
+  "build": {
+    "appId": "com.agentmailbox.desktop",
+    "productName": "AgentMailbox",
+    "extraMetadata": {
+      "main": "dist-electron/main.js"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*",
+      "node_modules/cpu-features/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    }
+  },
   "engines": {
     "node": ">=20"
   },
@@ -96,6 +127,8 @@
     "@types/react-dom": "^19.2.3",
     "@types/uuid": "^10.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
     "openai": "^4.50.0",
     "pino-pretty": "^11.3.0",
     "ts-node": "^10.9.2",

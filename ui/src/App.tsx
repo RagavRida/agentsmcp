@@ -59,6 +59,10 @@ type EvidenceBundle = {
   impact: ImpactAnalysisResult;
 };
 type UploadFile = File & { webkitRelativePath?: string };
+type DesktopBridge = {
+  getConfig: () => Promise<{ apiBase: string; desktop: boolean; userDataPath: string }>;
+  onServerExit: (callback: (event: { code: number | null; signal: string | null }) => void) => () => void;
+};
 type ConnectorResponse = { connector?: string; indexed: number; skipped: number; failed: number; files?: unknown[] };
 type ConnectorRun = {
   connectorRunId: string;
@@ -84,7 +88,7 @@ type ModelHealth = {
   openaiCompatible?: boolean;
 };
 
-const API_BASE = (window as Window & { AGENTMAILBOX_API?: string }).AGENTMAILBOX_API ?? "";
+const API_BASE = (window as Window & { AGENTMAILBOX_API?: string; AgentMailboxDesktop?: DesktopBridge }).AGENTMAILBOX_API ?? "";
 const MAX_IMPORT_FILES = 500;
 const IGNORED_REPO_SEGMENTS = new Set([".git", "node_modules", "dist", "build", "target", ".next", ".cache", "coverage"]);
 const SOURCE_EXTENSIONS = new Set([
@@ -130,6 +134,7 @@ const fallbackCapabilityMatrix: ProductCapabilityMatrix = {
 };
 
 function App() {
+  const [apiBase, setApiBase] = useState(API_BASE);
   const [view, setView] = useState<View>("chat");
   const [graphMode, setGraphMode] = useState<GraphMode>("Graph");
   const [selectedId, setSelectedId] = useState("WS-PGMNAME");
@@ -172,7 +177,7 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    void fetch(`${API_BASE}/api/v1/product/capabilities`)
+    void fetch(`${apiBase}/api/v1/product/capabilities`)
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("Capability API unavailable")))
       .then((payload: ProductCapabilityMatrix) => {
         if (active) setCapabilityMatrix(payload);
@@ -181,10 +186,23 @@ function App() {
         if (active) setCapabilityMatrix(fallbackCapabilityMatrix);
       });
     return () => { active = false; };
-  }, []);
+  }, [apiBase]);
 
   useEffect(() => {
     void refreshInventory();
+  }, [apiBase]);
+
+  useEffect(() => {
+    const desktop = (window as Window & { AgentMailboxDesktop?: DesktopBridge }).AgentMailboxDesktop;
+    if (!desktop) return;
+    let cleanup: (() => void) | undefined;
+    void desktop.getConfig().then((config) => {
+      setApiBase(config.apiBase);
+    });
+    cleanup = desktop.onServerExit(() => {
+      setConnectorStatus("The local AgentMailbox server stopped. Restart the desktop app to reconnect.");
+    });
+    return () => cleanup?.();
   }, []);
 
   useEffect(() => {
@@ -194,7 +212,7 @@ function App() {
 
   async function refreshInventory() {
     try {
-      const response = await fetch(`${API_BASE}/api/v1/ingest/inventory`, {
+      const response = await fetch(`${apiBase}/api/v1/ingest/inventory`, {
         headers: requestHeaders(),
       });
       if (!response.ok) return;
@@ -206,7 +224,7 @@ function App() {
 
   async function refreshConnectorRuns() {
     try {
-      const response = await fetch(`${API_BASE}/api/v1/connectors/runs`, {
+      const response = await fetch(`${apiBase}/api/v1/connectors/runs`, {
         headers: requestHeaders(),
       });
       if (!response.ok) return;
@@ -228,7 +246,7 @@ function App() {
 
   async function search(cleanQuery: string) {
     try {
-      const response = await fetch(`${API_BASE}/api/v1/chat/answer`, {
+      const response = await fetch(`${apiBase}/api/v1/chat/answer`, {
         method: "POST",
         headers: requestHeaders(true),
         body: JSON.stringify({ query: cleanQuery, limit: 6 }),
@@ -285,7 +303,7 @@ function App() {
         setImportStatus("Choose repository files or paste source before ingesting.");
         return;
       }
-      const response = await fetch(`${API_BASE}/api/v1/ingest`, {
+      const response = await fetch(`${apiBase}/api/v1/ingest`, {
         method: "POST",
         headers: requestHeaders(true),
         body: JSON.stringify({
@@ -314,7 +332,7 @@ function App() {
   async function openSourceDetails(sourceId: string) {
     setDetailsStatus("Loading source details...");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/ingest/sources/${encodeURIComponent(sourceId)}`, {
+      const response = await fetch(`${apiBase}/api/v1/ingest/sources/${encodeURIComponent(sourceId)}`, {
         headers: requestHeaders(),
       });
       if (!response.ok) throw new Error("Source details unavailable");
@@ -333,7 +351,7 @@ function App() {
     try {
       const params = new URLSearchParams({ sourceId, maxResults: "20" });
       if (ruleId) params.set("ruleId", ruleId);
-      const response = await fetch(`${API_BASE}/api/v1/impact/analyze?${params.toString()}`, {
+      const response = await fetch(`${apiBase}/api/v1/impact/analyze?${params.toString()}`, {
         headers: requestHeaders(),
       });
       if (!response.ok) throw new Error("Impact analysis failed");
@@ -351,7 +369,7 @@ function App() {
     try {
       const params = new URLSearchParams({ sourceId, maxResults: "20" });
       if (ruleId) params.set("ruleId", ruleId);
-      const response = await fetch(`${API_BASE}/api/v1/evidence/export?${params.toString()}`, {
+      const response = await fetch(`${apiBase}/api/v1/evidence/export?${params.toString()}`, {
         headers: requestHeaders(),
       });
       if (!response.ok) throw new Error("Evidence export failed");
@@ -392,7 +410,7 @@ function App() {
   }
 
   async function ingestConnectorFiles(files: Array<{ sourceId: string; filename: string; code: string; language: string }>, connectorRunId: string, connector: string) {
-    const response = await fetch(`${API_BASE}/api/v1/ingest`, {
+    const response = await fetch(`${apiBase}/api/v1/ingest`, {
       method: "POST",
       headers: requestHeaders(true),
       body: JSON.stringify({ dataset: connectorDataset, connectorRunId, connector, files }),
@@ -408,7 +426,7 @@ function App() {
     event.preventDefault();
     setConnectorStatus("Cloning repository and scanning source files...");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/connectors/git`, {
+      const response = await fetch(`${apiBase}/api/v1/connectors/git`, {
         method: "POST",
         headers: requestHeaders(true),
         body: JSON.stringify({
@@ -432,7 +450,7 @@ function App() {
     event.preventDefault();
     setConnectorStatus("Connecting to SFTP and scanning remote source files...");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/connectors/sftp`, {
+      const response = await fetch(`${apiBase}/api/v1/connectors/sftp`, {
         method: "POST",
         headers: requestHeaders(true),
         body: JSON.stringify({
@@ -458,14 +476,14 @@ function App() {
   async function loadModelOps() {
     setModelStatus("Checking model and telemetry endpoints...");
     try {
-      const healthResponse = await fetch(`${API_BASE}/api/v1/model/health`, { headers: requestHeaders() });
+      const healthResponse = await fetch(`${apiBase}/api/v1/model/health`, { headers: requestHeaders() });
       const health = await healthResponse.json();
       setModelHealth(health);
     } catch {
       setModelHealth(null);
     }
     try {
-      const metricsResponse = await fetch(`${API_BASE}/metrics`, { headers: requestHeaders() });
+      const metricsResponse = await fetch(`${apiBase}/metrics`, { headers: requestHeaders() });
       setMetricsText(metricsResponse.ok ? await metricsResponse.text() : "");
     } catch {
       setMetricsText("");

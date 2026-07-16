@@ -562,9 +562,12 @@ export function createServer(
     res.json(getProductCapabilityMatrix());
   });
 
-  const uiDistPath = join(__dirname, "..", "ui", "dist");
-  const uiIndexPath = join(uiDistPath, "index.html");
-  if (existsSync(uiIndexPath)) {
+  // In source runs Vite writes to ui/dist; the packaged desktop build places
+  // the UI alongside the compiled server in dist. Support both layouts.
+  const uiDistPath = [join(__dirname, "..", "ui", "dist"), __dirname]
+    .find((candidate) => existsSync(join(candidate, "index.html")));
+  const uiIndexPath = uiDistPath ? join(uiDistPath, "index.html") : "";
+  if (uiDistPath && existsSync(uiIndexPath)) {
     app.use(
       express.static(uiDistPath, {
         fallthrough: true,
