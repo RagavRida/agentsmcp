@@ -56,7 +56,7 @@ export interface ApiServerOptions {
   pipelineOrchestrator?: PipelineOrchestratorLike;
   graphSearchProvider?: GraphSearchProvider;
   vectorStore?: VectorSearchProvider;
-  ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory" | "sourceDetails" | "recordEvidenceExport">;
+  ingestionService?: Pick<SourceIngestionService, "ingest" | "inventory" | "sourceDetails" | "recordEvidenceExport" | "connectorRuns" | "recordConnectorRunFailure">;
   groundedAnswerGenerator?: GroundedAnswerGenerator;
 }
 
@@ -132,6 +132,16 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
     });
   });
 
+  app.get(
+    "/api/v1/connectors/runs",
+    asyncHandler(async (req, res) => {
+      if (!opts.ingestionService) {
+        throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
+      }
+      res.json({ runs: await opts.ingestionService.connectorRuns(tenantScopeFromRequest(req)) });
+    }),
+  );
+
   app.post(
     "/api/v1/extract",
     asyncHandler(async (req, res) => {
@@ -181,12 +191,29 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
       const scope = tenantScopeFromRequest(req);
-      const artifacts = await cloneGitRepository(withTenant(parsedBody.data, scope));
-      if (artifacts.files.length === 0) {
-        throw new ApiError(422, "NO_IMPORTABLE_SOURCES", "The repository did not contain supported mainframe source files");
+      const startedAt = new Date().toISOString();
+      const request = withTenant({
+        ...parsedBody.data,
+        connectorRunId: parsedBody.data.connectorRunId ?? `git-${Date.now()}`,
+      }, scope);
+      try {
+        const artifacts = await cloneGitRepository(request);
+        if (artifacts.files.length === 0) {
+          throw new ApiError(422, "NO_IMPORTABLE_SOURCES", "The repository did not contain supported mainframe source files");
+        }
+        const result = await opts.ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+        res.status(result.failed > 0 ? 207 : 200).json({ connector: "git", ...result });
+      } catch (error) {
+        await opts.ingestionService.recordConnectorRunFailure({
+          connector: "git",
+          connectorRunId: request.connectorRunId,
+          dataset: request.dataset,
+          tenantId: scope.tenantId,
+          startedAt,
+          error: publicConnectorError(error),
+        });
+        throw error;
       }
-      const result = await opts.ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
-      res.status(result.failed > 0 ? 207 : 200).json({ connector: "git", ...result });
     }),
   );
 
@@ -201,12 +228,29 @@ export function createApiApp(options: ApiServerOptions = {}): express.Express {
         throw new ApiError(503, "INGESTION_NOT_CONFIGURED", "No enterprise ingestion service is configured");
       }
       const scope = tenantScopeFromRequest(req);
-      const artifacts = await readSftpRepository(withTenant(parsedBody.data, scope));
-      if (artifacts.files.length === 0) {
-        throw new ApiError(422, "NO_IMPORTABLE_SOURCES", "The SFTP path did not contain supported mainframe source files");
+      const startedAt = new Date().toISOString();
+      const request = withTenant({
+        ...parsedBody.data,
+        connectorRunId: parsedBody.data.connectorRunId ?? `sftp-${Date.now()}`,
+      }, scope);
+      try {
+        const artifacts = await readSftpRepository(request);
+        if (artifacts.files.length === 0) {
+          throw new ApiError(422, "NO_IMPORTABLE_SOURCES", "The SFTP path did not contain supported mainframe source files");
+        }
+        const result = await opts.ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+        res.status(result.failed > 0 ? 207 : 200).json({ connector: "sftp", ...result });
+      } catch (error) {
+        await opts.ingestionService.recordConnectorRunFailure({
+          connector: "sftp",
+          connectorRunId: request.connectorRunId,
+          dataset: request.dataset,
+          tenantId: scope.tenantId,
+          startedAt,
+          error: publicConnectorError(error),
+        });
+        throw error;
       }
-      const result = await opts.ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
-      res.status(result.failed > 0 ? 207 : 200).json({ connector: "sftp", ...result });
     }),
   );
 
@@ -553,6 +597,14 @@ function scoreRule(rule: BusinessRuleResult, terms: string[]): number {
     rule.description,
   ].filter(Boolean).join(" ").toLowerCase();
   return terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
+}
+
+function publicConnectorError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/(https?:\/\/)[^@\s/]+@/gi, "$1")
+    .replace(/(bearer\s+)[a-z0-9._~+/=-]+/gi, "$1[redacted]")
+    .slice(0, 1000);
 }
 
 function asyncHandler(

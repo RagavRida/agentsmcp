@@ -399,10 +399,27 @@ describe("AgentMailbox Memory API", () => {
       const second = await fetch(`${url}/api/v1/ingest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, connector: "browser-folder" }),
       });
       expect(second.status).toBe(200);
       expect(await second.json()).toMatchObject({ indexed: 0, skipped: 2, failed: 0 });
+
+      const connectorRuns = await fetch(`${url}/api/v1/connectors/runs`);
+      expect(connectorRuns.status).toBe(200);
+      expect(await connectorRuns.json()).toMatchObject({
+        runs: [
+          expect.objectContaining({
+            connectorRunId: "run-001",
+            connector: "browser-folder",
+            dataset: "core-banking",
+            status: "completed",
+            totalFiles: 2,
+            indexed: 0,
+            skipped: 2,
+            failed: 0,
+          }),
+        ],
+      });
 
       const inventory = await fetch(`${url}/api/v1/ingest/inventory`);
       expect(inventory.status).toBe(200);
@@ -484,6 +501,49 @@ describe("AgentMailbox Memory API", () => {
         sourceId: "core/LOAN.CBL",
         ruleId: "rule-interest",
         contentHash: bundle.metadata.contentHash,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records failed Git connector attempts in run history", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmailbox-git-failure-"));
+    try {
+      const ingestionService = new IngestionService({
+        manifestStorage: new LocalStorageAdapter(root),
+        processor: {
+          async process() {
+            throw new Error("should not process files when clone is rejected");
+          },
+        },
+      });
+      const url = await start(createApiApp({ ingestionService }));
+      const response = await fetch(`${url}/api/v1/connectors/git`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-AgentMailbox-Tenant": "tenant-a" },
+        body: JSON.stringify({
+          dataset: "core-banking",
+          connectorRunId: "git-failure-001",
+          repoUrl: "ftp://user:secret@example.invalid/repo.git",
+        }),
+      });
+      expect(response.status).toBe(500);
+
+      const runs = await fetch(`${url}/api/v1/connectors/runs`, {
+        headers: { "X-AgentMailbox-Tenant": "tenant-a" },
+      });
+      expect(await runs.json()).toMatchObject({
+        runs: [
+          expect.objectContaining({
+            connectorRunId: "git-failure-001",
+            connector: "git",
+            status: "failed",
+            dataset: "core-banking",
+            tenantId: "tenant-a",
+            error: "Unsupported Git repository URL. Use HTTPS, SSH, or a configured test file URL.",
+          }),
+        ],
       });
     } finally {
       await rm(root, { recursive: true, force: true });

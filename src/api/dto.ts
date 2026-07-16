@@ -4,6 +4,7 @@ export const IngestRequestSchema = z.object({
   dataset: z.string().min(1).max(256),
   tenantId: z.string().min(1).max(256).optional(),
   connectorRunId: z.string().max(256).optional(),
+  connector: z.string().min(1).max(64).optional(),
   files: z.array(z.object({
     sourceId: z.string().min(1).max(512), filename: z.string().min(1).max(512), code: z.string().min(1).max(10_000_000),
     tenantId: z.string().min(1).max(256).optional(), language: z.enum(["auto", "cobol", "jcl", "pli", "rexx", "unknown"]).optional(), dataset: z.string().min(1).max(256).optional(), version: z.string().max(256).optional(), encoding: z.string().max(64).optional(), metadata: z.record(z.string()).optional(), copybooks: z.record(z.string()).optional(),

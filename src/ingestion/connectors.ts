@@ -50,6 +50,7 @@ export interface DirectoryConnectorOptions extends TenantScope {
 export interface ConnectorArtifacts {
   dataset: string;
   connectorRunId?: string;
+  connector?: string;
   files: SourceArtifact[];
 }
 
@@ -108,12 +109,13 @@ export async function cloneGitRepository(
         GIT_ASKPASS: "echo",
       },
     });
-    return await collectSourceArtifactsFromDirectory(checkoutDirectory, {
+    const artifacts = await collectSourceArtifactsFromDirectory(checkoutDirectory, {
       dataset: request.dataset,
       tenantId: request.tenantId,
       connectorRunId: request.connectorRunId ?? `git-${Date.now()}`,
       maxFiles: request.maxFiles,
     });
+    return { ...artifacts, connector: "git" };
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
@@ -168,7 +170,7 @@ export async function readSftpRepository(
     await client.end();
   }
 
-  return { dataset: request.dataset, connectorRunId: request.connectorRunId ?? `sftp-${Date.now()}`, files };
+  return { dataset: request.dataset, connectorRunId: request.connectorRunId ?? `sftp-${Date.now()}`, connector: "sftp", files };
 }
 
 export function connectorArtifactsToIngestionRequest(
@@ -178,6 +180,7 @@ export function connectorArtifactsToIngestionRequest(
   return {
     dataset: artifacts.dataset,
     connectorRunId: artifacts.connectorRunId,
+    connector: artifacts.connector,
     tenantId: scope.tenantId,
     files: artifacts.files.map((file) => ({
       ...file,

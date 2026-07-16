@@ -171,6 +171,14 @@ function withTenant<T extends { tenantId?: string }>(value: T, scope: TenantScop
   return scope.tenantId ? { ...value, tenantId: scope.tenantId } : value;
 }
 
+function publicConnectorError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/(https?:\/\/)[^@\s/]+@/gi, "$1")
+    .replace(/(bearer\s+)[a-z0-9._~+/=-]+/gi, "$1[redacted]")
+    .slice(0, 1000);
+}
+
 function scopedIngestionProvider(provider: IngestionService, scope: TenantScope) {
   return {
     inventory: () => provider.inventory(scope),
@@ -629,6 +637,10 @@ export function createServer(
     });
   });
 
+  app.get("/api/v1/connectors/runs", asyncHandler(async (req: Request, res: Response) => {
+    return res.status(200).json({ runs: await ingestionService.connectorRuns(tenantScopeFromRequest(req)) });
+  }));
+
   app.post("/api/v1/connectors/git", asyncHandler(async (req: Request, res: Response) => {
     const parsedBody = GitConnectorRequestSchema.safeParse(req.body);
     if (!parsedBody.success) {
@@ -641,17 +653,42 @@ export function createServer(
       });
     }
     const scope = tenantScopeFromRequest(req);
-    const artifacts = await cloneGitRepository(withTenant(parsedBody.data, scope));
-    if (artifacts.files.length === 0) {
-      return res.status(422).json({
-        error: {
-          code: "NO_IMPORTABLE_SOURCES",
-          message: "The repository did not contain supported mainframe source files",
-        },
+    const startedAt = new Date().toISOString();
+    const request = withTenant({
+      ...parsedBody.data,
+      connectorRunId: parsedBody.data.connectorRunId ?? `git-${Date.now()}`,
+    }, scope);
+    try {
+      const artifacts = await cloneGitRepository(request);
+      if (artifacts.files.length === 0) {
+        await ingestionService.recordConnectorRunFailure({
+          connector: "git",
+          connectorRunId: request.connectorRunId,
+          dataset: request.dataset,
+          tenantId: scope.tenantId,
+          startedAt,
+          error: "The repository did not contain supported mainframe source files",
+        });
+        return res.status(422).json({
+          error: {
+            code: "NO_IMPORTABLE_SOURCES",
+            message: "The repository did not contain supported mainframe source files",
+          },
+        });
+      }
+      const result = await ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+      return res.status(result.failed > 0 ? 207 : 200).json({ connector: "git", ...result });
+    } catch (error) {
+      await ingestionService.recordConnectorRunFailure({
+        connector: "git",
+        connectorRunId: request.connectorRunId,
+        dataset: request.dataset,
+        tenantId: scope.tenantId,
+        startedAt,
+        error: publicConnectorError(error),
       });
+      throw error;
     }
-    const result = await ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
-    return res.status(result.failed > 0 ? 207 : 200).json({ connector: "git", ...result });
   }));
 
   app.post("/api/v1/connectors/sftp", asyncHandler(async (req: Request, res: Response) => {
@@ -666,17 +703,42 @@ export function createServer(
       });
     }
     const scope = tenantScopeFromRequest(req);
-    const artifacts = await readSftpRepository(withTenant(parsedBody.data, scope));
-    if (artifacts.files.length === 0) {
-      return res.status(422).json({
-        error: {
-          code: "NO_IMPORTABLE_SOURCES",
-          message: "The SFTP path did not contain supported mainframe source files",
-        },
+    const startedAt = new Date().toISOString();
+    const request = withTenant({
+      ...parsedBody.data,
+      connectorRunId: parsedBody.data.connectorRunId ?? `sftp-${Date.now()}`,
+    }, scope);
+    try {
+      const artifacts = await readSftpRepository(request);
+      if (artifacts.files.length === 0) {
+        await ingestionService.recordConnectorRunFailure({
+          connector: "sftp",
+          connectorRunId: request.connectorRunId,
+          dataset: request.dataset,
+          tenantId: scope.tenantId,
+          startedAt,
+          error: "The SFTP path did not contain supported mainframe source files",
+        });
+        return res.status(422).json({
+          error: {
+            code: "NO_IMPORTABLE_SOURCES",
+            message: "The SFTP path did not contain supported mainframe source files",
+          },
+        });
+      }
+      const result = await ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
+      return res.status(result.failed > 0 ? 207 : 200).json({ connector: "sftp", ...result });
+    } catch (error) {
+      await ingestionService.recordConnectorRunFailure({
+        connector: "sftp",
+        connectorRunId: request.connectorRunId,
+        dataset: request.dataset,
+        tenantId: scope.tenantId,
+        startedAt,
+        error: publicConnectorError(error),
       });
+      throw error;
     }
-    const result = await ingestionService.ingest(connectorArtifactsToIngestionRequest(artifacts, scope));
-    return res.status(result.failed > 0 ? 207 : 200).json({ connector: "sftp", ...result });
   }));
 
   app.get("/api/v1/ingest/inventory", asyncHandler(async (req: Request, res: Response) => {

@@ -1,23 +1,25 @@
 import { createHash } from "node:crypto";
 import type { Memory } from "../memory/api";
 import type { StorageAdapter } from "../storage/interfaces";
-import type { IngestionInventory, IngestionInventoryEntry, IngestionProcessor, IngestionRequest, IngestionResponse, SourceArtifact, IngestionFileResult, IngestionSourceDetails, TenantScope } from "./contracts";
+import type { ConnectorRunRecord, IngestionInventory, IngestionInventoryEntry, IngestionProcessor, IngestionRequest, IngestionResponse, SourceArtifact, IngestionFileResult, IngestionSourceDetails, TenantScope } from "./contracts";
 import { evidenceAuditRecord, type EvidenceAuditRecord, type EvidenceBundle } from "../evidence/export";
 
 interface IngestionManifest { sourceId: string; checksum: string; version?: string; indexedAt: string; program?: string; }
-export interface IngestionServiceOptions { processor: IngestionProcessor; manifestStorage: StorageAdapter; manifestPrefix?: string; inventoryKey?: string; detailsPrefix?: string; evidencePrefix?: string; evidenceAuditKey?: string; }
+export interface IngestionServiceOptions { processor: IngestionProcessor; manifestStorage: StorageAdapter; manifestPrefix?: string; inventoryKey?: string; connectorRunsKey?: string; detailsPrefix?: string; evidencePrefix?: string; evidenceAuditKey?: string; }
 
 export class IngestionService {
   private readonly processor: IngestionProcessor;
   private readonly storage: StorageAdapter;
   private readonly prefix: string;
   private readonly inventoryKey: string;
+  private readonly connectorRunsKey: string;
   private readonly detailsPrefix: string;
   private readonly evidencePrefix: string;
   private readonly evidenceAuditKey: string;
-  constructor(options: IngestionServiceOptions) { this.processor = options.processor; this.storage = options.manifestStorage; this.prefix = options.manifestPrefix ?? "ingestion/manifests"; this.inventoryKey = options.inventoryKey ?? "ingestion/inventory.json"; this.detailsPrefix = options.detailsPrefix ?? "ingestion/details"; this.evidencePrefix = options.evidencePrefix ?? "ingestion/evidence"; this.evidenceAuditKey = options.evidenceAuditKey ?? "ingestion/evidence/audit.json"; }
+  constructor(options: IngestionServiceOptions) { this.processor = options.processor; this.storage = options.manifestStorage; this.prefix = options.manifestPrefix ?? "ingestion/manifests"; this.inventoryKey = options.inventoryKey ?? "ingestion/inventory.json"; this.connectorRunsKey = options.connectorRunsKey ?? "ingestion/connector-runs.json"; this.detailsPrefix = options.detailsPrefix ?? "ingestion/details"; this.evidencePrefix = options.evidencePrefix ?? "ingestion/evidence"; this.evidenceAuditKey = options.evidenceAuditKey ?? "ingestion/evidence/audit.json"; }
 
   async ingest(request: IngestionRequest): Promise<IngestionResponse> {
+    const startedAt = new Date().toISOString();
     const files: IngestionFileResult[] = [];
     const tenantId = tenantForRequest(request);
     for (const file of request.files) {
@@ -33,6 +35,7 @@ export class IngestionService {
     }
     const response = { dataset: request.dataset, connectorRunId: request.connectorRunId, indexed: files.filter((file) => file.status === "indexed").length, skipped: files.filter((file) => file.status === "skipped").length, failed: files.filter((file) => file.status === "failed").length, files };
     await this.updateInventory(request, files);
+    await this.recordConnectorRun(request, response, startedAt);
     return response;
   }
 
@@ -49,6 +52,38 @@ export class IngestionService {
       if (scope.tenantId && details.tenantId !== scope.tenantId) return null;
       return details;
     } catch { return null; }
+  }
+
+  async connectorRuns(scope: TenantScope = {}): Promise<ConnectorRunRecord[]> {
+    const runs = await this.readConnectorRuns();
+    return runs.filter((run) => !scope.tenantId || run.tenantId === scope.tenantId);
+  }
+
+  async recordConnectorRunFailure(input: {
+    connectorRunId: string;
+    connector: string;
+    dataset: string;
+    tenantId?: string;
+    startedAt?: string;
+    error: string;
+  }): Promise<void> {
+    const run: ConnectorRunRecord = {
+      connectorRunId: input.connectorRunId,
+      connector: input.connector,
+      tenantId: input.tenantId,
+      dataset: input.dataset,
+      status: "failed",
+      startedAt: input.startedAt ?? new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+      totalFiles: 0,
+      indexed: 0,
+      skipped: 0,
+      failed: 0,
+      error: input.error,
+    };
+    const current = await this.readConnectorRuns();
+    const next = [run, ...current.filter((item) => !(item.connectorRunId === run.connectorRunId && item.tenantId === run.tenantId))].slice(0, 500);
+    await this.storage.write(this.connectorRunsKey, JSON.stringify(next, null, 2));
   }
 
   async recordEvidenceExport(bundle: EvidenceBundle): Promise<void> {
@@ -82,6 +117,28 @@ export class IngestionService {
     await this.storage.write(this.detailsKey(file.sourceId, tenantId), JSON.stringify(details, null, 2));
   }
   private async readInventory(): Promise<IngestionInventory> { const raw = await this.storage.read(this.inventoryKey); if (!raw) return emptyInventory(); try { return normalizeInventory(JSON.parse(raw.toString("utf8"))); } catch { return emptyInventory(); } }
+  private async readConnectorRuns(): Promise<ConnectorRunRecord[]> { const raw = await this.storage.read(this.connectorRunsKey); if (!raw) return []; try { const parsed = JSON.parse(raw.toString("utf8")); return Array.isArray(parsed) ? parsed as ConnectorRunRecord[] : []; } catch { return []; } }
+  private async recordConnectorRun(request: IngestionRequest, response: IngestionResponse, startedAt: string): Promise<void> {
+    if (!request.connectorRunId) return;
+    const tenantId = tenantForRequest(request);
+    const run: ConnectorRunRecord = {
+      connectorRunId: request.connectorRunId,
+      connector: request.connector ?? inferConnectorName(request.connectorRunId),
+      tenantId,
+      dataset: request.dataset,
+      status: response.failed > 0 ? "completed_with_errors" : "completed",
+      startedAt,
+      completedAt: new Date().toISOString(),
+      totalFiles: response.files.length,
+      indexed: response.indexed,
+      skipped: response.skipped,
+      failed: response.failed,
+      error: response.files.find((file) => file.error)?.error,
+    };
+    const current = await this.readConnectorRuns();
+    const next = [run, ...current.filter((item) => !(item.connectorRunId === run.connectorRunId && item.tenantId === run.tenantId))].slice(0, 500);
+    await this.storage.write(this.connectorRunsKey, JSON.stringify(next, null, 2));
+  }
   private async updateInventory(request: IngestionRequest, files: IngestionFileResult[]): Promise<void> {
     const inventory = await this.readInventory();
     const bySource = new Map(inventory.files.map((file) => [inventoryKeyFor(file.sourceId, file.tenantId), file]));
@@ -144,4 +201,9 @@ function safeParseAudit(raw: Buffer): EvidenceAuditRecord[] {
   } catch {
     return [];
   }
+}
+
+function inferConnectorName(connectorRunId: string): string {
+  const prefix = connectorRunId.split("-")[0]?.trim();
+  return prefix || "unknown";
 }
