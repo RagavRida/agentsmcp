@@ -2,7 +2,7 @@ import type { Server } from "http";
 import type { AddressInfo } from "net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApiApp, type PipelineOrchestratorLike } from "../src/api/server";
-import { IngestionService } from "../src/ingestion";
+import { IngestionService, KnowledgeEnrichmentService } from "../src/ingestion";
 import { LocalStorageAdapter } from "../src/storage/interfaces";
 import type { ParseCobolResult } from "../src/parser";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -301,8 +301,12 @@ describe("AgentMailbox Memory API", () => {
         expect.objectContaining({ id: "zip", status: "live" }),
         expect.objectContaining({ id: "git", endpoint: "/api/v1/connectors/git" }),
         expect.objectContaining({ id: "sftp", endpoint: "/api/v1/connectors/sftp" }),
+        expect.objectContaining({ id: "document", endpoint: "/api/v1/enrichment/inputs", status: "beta" }),
+        expect.objectContaining({ id: "expert-interview", endpoint: "/api/v1/enrichment/inputs", status: "beta" }),
+        expect.objectContaining({ id: "scheduler-history", endpoint: "/api/v1/enrichment/inputs", status: "beta" }),
+        expect.objectContaining({ id: "telemetry", endpoint: "/api/v1/enrichment/inputs", status: "beta" }),
       ]),
-      limits: expect.objectContaining({ maxFiles: 500 }),
+      limits: expect.objectContaining({ maxFiles: 500, maxKnowledgeInputs: 200 }),
     });
   });
 
@@ -339,6 +343,70 @@ describe("AgentMailbox Memory API", () => {
         ],
       });
       expect(artifacts.files).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("captures external knowledge inputs with provenance", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmailbox-enrichment-"));
+    try {
+      const enrichmentService = new KnowledgeEnrichmentService({
+        storage: new LocalStorageAdapter(root),
+      });
+      const url = await start(createApiApp({ enrichmentService }));
+      const response = await fetch(`${url}/api/v1/enrichment/inputs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-AgentMailbox-Tenant": "tenant-a" },
+        body: JSON.stringify({
+          dataset: "claims",
+          connectorRunId: "expert-001",
+          connector: "expert-interview",
+          inputs: [
+            {
+              inputId: "claims/interviews/retired-sme",
+              title: "Retired SME claims interview",
+              kind: "expert_interview",
+              subject: "Claims adjudication timing",
+              content: "The night batch intentionally delays disputed claims until supervisor review is complete.",
+              relatedSourceIds: ["claims/ADJUDICATE.CBL"],
+              provenance: {
+                sourceSystem: "SME interview",
+                capturedBy: "analyst@example.com",
+              },
+            },
+          ],
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ingested: 1,
+        records: [
+          expect.objectContaining({
+            inputId: "claims/interviews/retired-sme",
+            kind: "expert_interview",
+            tenantId: "tenant-a",
+            connector: "expert-interview",
+            provenance: expect.objectContaining({ sourceSystem: "SME interview" }),
+          }),
+        ],
+      });
+
+      const inventory = await fetch(`${url}/api/v1/enrichment/inventory`, {
+        headers: { "X-AgentMailbox-Tenant": "tenant-a" },
+      });
+      expect(inventory.status).toBe(200);
+      expect(await inventory.json()).toMatchObject({
+        totalInputs: 1,
+        byKind: expect.objectContaining({ expert_interview: 1 }),
+        records: [
+          expect.objectContaining({
+            title: "Retired SME claims interview",
+            contentPreview: expect.stringContaining("night batch"),
+          }),
+        ],
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -628,7 +696,7 @@ describe("AgentMailbox Memory API", () => {
     const body = await response.json() as {
       capabilities: Array<{ id: string; status: string; evidence: string[] }>;
     };
-    expect(body.capabilities.some((item) => item.status === "roadmap")).toBe(true);
+    expect(body.capabilities.some((item) => item.status === "live" || item.status === "beta")).toBe(true);
     expect(body.capabilities.find((item) => item.id === "mainframe-parser-registry")).toMatchObject({
       status: "live",
     });
@@ -639,6 +707,10 @@ describe("AgentMailbox Memory API", () => {
     expect(body.capabilities.find((item) => item.id === "audit-compliance-exports")).toMatchObject({
       status: "beta",
       evidence: expect.arrayContaining(["src/evidence/export.ts", "tests/api-server.test.ts"]),
+    });
+    expect(body.capabilities.find((item) => item.id === "expert-telemetry-enrichment")).toMatchObject({
+      status: "beta",
+      evidence: expect.arrayContaining(["src/ingestion/enrichment-service.ts", "ui/src/App.tsx"]),
     });
     expect(body.capabilities.every((item) => item.evidence.length > 0)).toBe(true);
   });
