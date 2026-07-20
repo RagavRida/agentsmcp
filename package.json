@@ -1,6 +1,6 @@
 {
   "name": "agentsmcp",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Context-sync protocol for AI agents. Every agent has a mailbox.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -30,7 +30,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke:e2e": "npm run build && node scripts/smoke-e2e.js",
-    "prepublishOnly": "npm run build && npm test"
+    "verify:package": "node scripts/verify-package-bins.js",
+    "prepack": "npm run build && npm run verify:package",
+    "prepublishOnly": "npm run build && npm test && npm run verify:package"
   },
   "keywords": [
     "agents",

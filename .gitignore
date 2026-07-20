@@ -12,6 +12,8 @@ dist-electron/
 release/
 .electron-gyp/
 .electron-home/
+.npm-cache/
+**/.npm-cache/
 *.tsbuildinfo
 
 # Local databases / WAL
